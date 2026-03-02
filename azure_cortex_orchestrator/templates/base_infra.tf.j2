@@ -1,0 +1,173 @@
+{# 
+  Base Terraform template for Azure-Cortex Orchestrator.
+  
+  This Jinja2 template provides the foundational structure for
+  the vulnerable Azure environment. The LLM enriches and customizes
+  this based on the specific attack scenario.
+
+  Variables:
+    - resource_group_name: Name of the resource group
+    - location: Azure region (default: eastus)
+    - subscription_id: Azure subscription ID
+    - vm_name: Name of the virtual machine
+    - vm_size: VM size (default: Standard_B1s)
+    - admin_username: VM admin username
+    - tags: Dict of Azure resource tags
+#}
+
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = "{{ subscription_id }}"
+}
+
+# ── Resource Group ────────────────────────────────────────────────
+resource "azurerm_resource_group" "sim" {
+  name     = "{{ resource_group_name }}"
+  location = "{{ location | default('eastus') }}"
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+    managed_by  = "azure-cortex-orchestrator"
+  }
+}
+
+# ── Networking ────────────────────────────────────────────────────
+resource "azurerm_virtual_network" "sim" {
+  name                = "{{ resource_group_name }}-vnet"
+  address_space       = ["10.0.0.0/16"]
+  location            = azurerm_resource_group.sim.location
+  resource_group_name = azurerm_resource_group.sim.name
+}
+
+resource "azurerm_subnet" "sim" {
+  name                 = "default"
+  resource_group_name  = azurerm_resource_group.sim.name
+  virtual_network_name = azurerm_virtual_network.sim.name
+  address_prefixes     = ["10.0.1.0/24"]
+}
+
+resource "azurerm_network_interface" "sim" {
+  name                = "{{ vm_name | default('sim-vm') }}-nic"
+  location            = azurerm_resource_group.sim.location
+  resource_group_name = azurerm_resource_group.sim.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.sim.id
+    private_ip_address_allocation = "Dynamic"
+  }
+}
+
+# ── Virtual Machine with Managed Identity ─────────────────────────
+resource "azurerm_linux_virtual_machine" "sim" {
+  name                            = "{{ vm_name | default('sim-vm') }}"
+  resource_group_name             = azurerm_resource_group.sim.name
+  location                        = azurerm_resource_group.sim.location
+  size                            = "{{ vm_size | default('Standard_B1s') }}"
+  admin_username                  = "{{ admin_username | default('simadmin') }}"
+  disable_password_authentication = true
+
+  network_interface_ids = [
+    azurerm_network_interface.sim.id,
+  ]
+
+  admin_ssh_key {
+    username   = "{{ admin_username | default('simadmin') }}"
+    public_key = tls_private_key.sim.public_key_openssh
+  }
+
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
+  }
+
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "0001-com-ubuntu-server-jammy"
+    sku       = "22_04-lts"
+    version   = "latest"
+  }
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+  }
+}
+
+# ── SSH Key (auto-generated) ─────────────────────────────────────
+resource "tls_private_key" "sim" {
+  algorithm = "RSA"
+  rsa_bits  = 4096
+}
+
+# ── VULNERABLE: Contributor Role at Subscription Scope ────────────
+# This is intentionally over-privileged for the simulation.
+resource "azurerm_role_assignment" "sim_contributor" {
+  scope                = "/subscriptions/{{ subscription_id }}"
+  role_definition_name = "Contributor"
+  principal_id         = azurerm_linux_virtual_machine.sim.identity[0].principal_id
+}
+
+# ── Log Analytics Workspace ──────────────────────────────────────
+resource "azurerm_log_analytics_workspace" "sim" {
+  name                = "{{ resource_group_name }}-law"
+  location            = azurerm_resource_group.sim.location
+  resource_group_name = azurerm_resource_group.sim.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+# ── Diagnostic Setting (Activity Log → Log Analytics) ─────────────
+# This is the target the attacker will delete.
+resource "azurerm_monitor_diagnostic_setting" "activity_logs" {
+  name                       = "activity-log-to-law"
+  target_resource_id         = "/subscriptions/{{ subscription_id }}"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.sim.id
+
+  enabled_log {
+    category = "Administrative"
+  }
+
+  enabled_log {
+    category = "Security"
+  }
+
+  enabled_log {
+    category = "Alert"
+  }
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "resource_group_name" {
+  value = azurerm_resource_group.sim.name
+}
+
+output "vm_name" {
+  value = azurerm_linux_virtual_machine.sim.name
+}
+
+output "vm_principal_id" {
+  value = azurerm_linux_virtual_machine.sim.identity[0].principal_id
+}
+
+output "diagnostic_setting_name" {
+  value = azurerm_monitor_diagnostic_setting.activity_logs.name
+}
+
+output "log_analytics_workspace_id" {
+  value = azurerm_log_analytics_workspace.sim.id
+}

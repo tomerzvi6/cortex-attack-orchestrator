@@ -1,0 +1,25 @@
+# Azure-Cortex Orchestrator — Dependencies
+# Python 3.10+ required
+
+# ── LangGraph / LangChain ─────────────────────────────────────────
+langgraph>=0.2.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+
+# ── OpenAI ────────────────────────────────────────────────────────
+openai>=1.0.0
+
+# ── Azure SDK ─────────────────────────────────────────────────────
+azure-identity>=1.15.0
+azure-mgmt-monitor>=6.0.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-compute>=30.0.0
+
+# ── Templating ────────────────────────────────────────────────────
+Jinja2>=3.1.0
+
+# ── Environment ───────────────────────────────────────────────────
+python-dotenv>=1.0.0
+
+# ── HTTP (for Cortex XDR API) ─────────────────────────────────────
+requests>=2.31.0
