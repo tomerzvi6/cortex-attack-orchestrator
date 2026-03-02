@@ -185,6 +185,12 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
 #  NODE: generate_infrastructure
 # ══════════════════════════════════════════════════════════════════
 
+FIX_TERRAFORM_SYSTEM_PROMPT = """\
+You are a Terraform expert. The following Terraform code failed with the error \
+below. Fix the code and return ONLY the corrected HCL. Do not explain, just \
+return the fixed code.
+"""
+
 GENERATE_INFRA_SYSTEM_PROMPT = """\
 You are an expert Terraform developer specializing in Azure infrastructure. \
 Your task is to generate complete, valid Terraform HCL code that deploys a \
@@ -220,68 +226,77 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
         scenario_id = state.get("scenario_id", "")
         run_id = state.get("run_id", "unknown")
 
-        # Load the Jinja2 base template as reference
-        templates_dir = Path(__file__).resolve().parent / "templates"
-        jinja_env = Environment(loader=FileSystemLoader(str(templates_dir)))
-
-        template_context = ""
-        try:
-            template = jinja_env.get_template("base_infra.tf.j2")
-            rendered = template.render(
-                resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
-                subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
-                run_id=run_id,
-                location="eastus",
-                vm_name=f"sim-vm-{run_id[:8]}",
-            )
-            template_context = f"\n\nHere's a reference template to guide your output:\n```hcl\n{rendered}\n```"
-        except Exception as exc:
-            log.warning("Failed to render Jinja2 template: %s", exc)
-
-        # Build prompt
-        retry_context = ""
+        # ── AI-assisted fix on retry ─────────────────────────────
         if deploy_retries > 0 and deploy_error:
-            retry_context = (
-                f"\n\n⚠️ PREVIOUS DEPLOYMENT FAILED (attempt {deploy_retries}):\n"
-                f"Error: {deploy_error}\n"
-                f"Please fix the Terraform code to resolve this error."
+            previous_code = state.get("terraform_code", "")
+            log.info(
+                "AI-assisted fix attempt #%d for Terraform error",
+                deploy_retries,
+            )
+            fix_user_prompt = (
+                f"## Failed Terraform Code\n```hcl\n{previous_code}\n```\n\n"
+                f"## Error\n```\n{deploy_error}\n```"
+            )
+            response = _call_openai(
+                FIX_TERRAFORM_SYSTEM_PROMPT,
+                fix_user_prompt,
+                max_tokens=8192,
+            )
+            terraform_code = _extract_hcl(response)
+        else:
+            # ── First run: generate from scratch ──────────────────
+            # Load the Jinja2 base template as reference
+            templates_dir = Path(__file__).resolve().parent / "templates"
+            jinja_env = Environment(loader=FileSystemLoader(str(templates_dir)))
+
+            template_context = ""
+            try:
+                template = jinja_env.get_template("base_infra.tf.j2")
+                rendered = template.render(
+                    resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
+                    subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
+                    run_id=run_id,
+                    location="eastus",
+                    vm_name=f"sim-vm-{run_id[:8]}",
+                )
+                template_context = f"\n\nHere's a reference template to guide your output:\n```hcl\n{rendered}\n```"
+            except Exception as exc:
+                log.warning("Failed to render Jinja2 template: %s", exc)
+
+            # Get scenario hints
+            scenario_hints = ""
+            try:
+                registry = ScenarioRegistry.get_instance()
+                scenario = registry.get(scenario_id)
+                scenario_hints = (
+                    f"\n\nScenario requirements:\n"
+                    f"- Resources: {scenario.terraform_hints.get('resource_types', [])}\n"
+                    f"- Role assignments: {scenario.terraform_hints.get('role_assignments', [])}\n"
+                    f"- Misconfigurations: {scenario.terraform_hints.get('misconfigurations', [])}\n"
+                    f"- Region: {scenario.terraform_hints.get('region', 'eastus')}\n"
+                )
+            except KeyError:
+                pass
+
+            user_prompt = (
+                f"Attack Plan:\n{json.dumps(attack_plan, indent=2)}\n"
+                f"{scenario_hints}"
+                f"{template_context}\n\n"
+                f"Subscription ID: {settings.azure_subscription_id or 'SUBSCRIPTION_ID'}\n"
+                f"Resource Group Prefix: {settings.resource_group_prefix}\n"
+                f"Run ID: {run_id}"
             )
 
-        # Get scenario hints
-        scenario_hints = ""
-        try:
-            registry = ScenarioRegistry.get_instance()
-            scenario = registry.get(scenario_id)
-            scenario_hints = (
-                f"\n\nScenario requirements:\n"
-                f"- Resources: {scenario.terraform_hints.get('resource_types', [])}\n"
-                f"- Role assignments: {scenario.terraform_hints.get('role_assignments', [])}\n"
-                f"- Misconfigurations: {scenario.terraform_hints.get('misconfigurations', [])}\n"
-                f"- Region: {scenario.terraform_hints.get('region', 'eastus')}\n"
+            log.info(
+                "Calling OpenAI to generate Terraform (first run)"
             )
-        except KeyError:
-            pass
+            response = _call_openai(
+                GENERATE_INFRA_SYSTEM_PROMPT,
+                user_prompt,
+                max_tokens=8192,
+            )
 
-        user_prompt = (
-            f"Attack Plan:\n{json.dumps(attack_plan, indent=2)}\n"
-            f"{scenario_hints}"
-            f"{template_context}"
-            f"{retry_context}\n\n"
-            f"Subscription ID: {settings.azure_subscription_id or 'SUBSCRIPTION_ID'}\n"
-            f"Resource Group Prefix: {settings.resource_group_prefix}\n"
-            f"Run ID: {run_id}"
-        )
-
-        log.info(
-            "Calling OpenAI to generate Terraform (retry=%d)", deploy_retries
-        )
-        response = _call_openai(
-            GENERATE_INFRA_SYSTEM_PROMPT,
-            user_prompt,
-            max_tokens=8192,
-        )
-
-        terraform_code = _extract_hcl(response)
+            terraform_code = _extract_hcl(response)
 
         # Set up Terraform working directory
         tf_runner = TerraformRunner(
@@ -448,23 +463,31 @@ def deploy_infrastructure(state: OrchestratorState) -> dict[str, Any]:
 
         except TerraformError as exc:
             new_retries = deploy_retries + 1
+            error_msg = exc.stderr if hasattr(exc, 'stderr') else str(exc)
+            error_history = list(state.get("deploy_error_history", []))
+            error_history.append(error_msg)
             log.error(
                 "Deployment failed (attempt %d/3): %s",
                 new_retries,
-                exc.stderr[:300] if hasattr(exc, 'stderr') else str(exc),
+                error_msg[:300],
             )
             return {
                 "deploy_status": "failed",
                 "deploy_retries": new_retries,
-                "deploy_error": exc.stderr if hasattr(exc, 'stderr') else str(exc),
+                "deploy_error": error_msg,
+                "deploy_error_history": error_history,
             }
         except Exception as exc:
             new_retries = deploy_retries + 1
+            error_msg = str(exc)
+            error_history = list(state.get("deploy_error_history", []))
+            error_history.append(error_msg)
             log.error("Unexpected deployment error: %s", exc)
             return {
                 "deploy_status": "failed",
                 "deploy_retries": new_retries,
-                "deploy_error": str(exc),
+                "deploy_error": error_msg,
+                "deploy_error_history": error_history,
             }
 
 

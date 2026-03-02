@@ -92,7 +92,7 @@ SCENARIO = Scenario(
                 "Authenticate using the service principal credentials "
                 "(simulating what the VM's Managed Identity could do)."
             ),
-            azure_sdk_action="identity.authenticate",
+            sdk_action="identity.authenticate",
             target_resource_type="Microsoft.ManagedIdentity",
         ),
         SimulationStep(
@@ -102,7 +102,7 @@ SCENARIO = Scenario(
                 "List all resources in the subscription to demonstrate "
                 "the breadth of Contributor access."
             ),
-            azure_sdk_action="resource.list",
+            sdk_action="resource.list",
             target_resource_type="Microsoft.Resources/subscriptions",
         ),
         SimulationStep(
@@ -112,7 +112,7 @@ SCENARIO = Scenario(
                 "Enumerate diagnostic settings on the subscription to "
                 "find activity log forwarding configurations."
             ),
-            azure_sdk_action="monitor.diagnostic_settings.list",
+            sdk_action="monitor.diagnostic_settings.list",
             target_resource_type="Microsoft.Insights/diagnosticSettings",
         ),
         SimulationStep(
@@ -122,7 +122,7 @@ SCENARIO = Scenario(
                 "Delete the diagnostic settings that forward Activity Logs, "
                 "effectively disabling the audit trail."
             ),
-            azure_sdk_action="monitor.diagnostic_settings.delete",
+            sdk_action="monitor.diagnostic_settings.delete",
             target_resource_type="Microsoft.Insights/diagnosticSettings",
         ),
         SimulationStep(
@@ -132,7 +132,7 @@ SCENARIO = Scenario(
                 "Verify that the diagnostic settings have been successfully "
                 "deleted and Activity Log forwarding is stopped."
             ),
-            azure_sdk_action="monitor.diagnostic_settings.list",
+            sdk_action="monitor.diagnostic_settings.list",
             target_resource_type="Microsoft.Insights/diagnosticSettings",
         ),
     ],

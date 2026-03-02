@@ -81,6 +81,7 @@ class OrchestratorState(TypedDict, total=False):
     deploy_status: str              # "pending" | "success" | "failed" | "unsafe"
     deploy_retries: int             # Current retry count (max 3)
     deploy_error: str               # Last deployment error message
+    deploy_error_history: list[str] # All deployment errors across retries
 
     # ── Safety ────────────────────────────────────────────────────
     safety_violations: list[str]    # List of safety guardrail violations
@@ -116,6 +117,7 @@ def create_initial_state(
         deploy_status="pending",
         deploy_retries=0,
         deploy_error="",
+        deploy_error_history=[],
         safety_violations=[],
         simulation_results=[],
         validation_result={},

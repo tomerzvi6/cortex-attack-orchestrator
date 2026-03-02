@@ -134,6 +134,44 @@ python -m azure_cortex_orchestrator.main \
   --goal "Exploit a VM's Managed Identity to exfiltrate data from a Storage Account"
 ```
 
+## Demo Dashboard
+
+The project includes a Streamlit-based **Demo Cockpit** for running and reviewing attack simulations through a visual interface.
+
+```bash
+pip install streamlit
+streamlit run dashboard/app.py
+```
+
+The dashboard provides:
+
+- **Dashboard tab** — Run simulations with live status updates, view MITRE ATT&CK mappings, simulation timelines, detection verdicts, and generated Terraform code.
+- **Reports tab** — Browse and review past simulation reports (Markdown + JSON download).
+- **Scenario Library tab** — Explore all registered attack scenarios with MITRE technique badges, simulation step counts, and Terraform resource types.
+
+> **Note:** The dashboard calls the same orchestration logic as the CLI (`compile_graph()` + `create_initial_state()` + graph invoke), so results are identical.
+
+## Multi-Cloud Support
+
+The orchestrator uses a **provider abstraction layer** (`cloud_providers/`) so that
+the same LangGraph graph, scenario definitions, and reporting pipeline can target
+multiple cloud platforms.
+
+| Provider | Status | Scenarios |
+|----------|--------|-----------|
+| **Azure** | ✅ Fully implemented | `vm_identity_log_deletion`, `storage_data_exfil`, `iam_privilege_escalation` |
+| **AWS** | 🔜 Scaffolded | `aws_s3_public_bucket` |
+
+Each cloud provider implements the `CloudProvider` abstract base class
+(`cloud_providers/base.py`) which exposes:
+
+- `authenticate(settings)` — cloud-specific credential setup
+- `execute_action(action, target_resource_type, parameters)` — SDK action dispatch
+- `get_terraform_provider_block()` — HCL provider block for IaC generation
+- `get_terraform_env_vars(settings)` — env vars for the Terraform subprocess
+
+Scenarios declare their target cloud via the `cloud_provider` field (default `"azure"`).
+
 ## Project Structure
 
 ```
@@ -143,9 +181,16 @@ azure_cortex_orchestrator/
 ├── nodes.py                 # All graph node functions
 ├── graph.py                 # StateGraph construction & compilation
 ├── config.py                # Settings from env vars
+├── cloud_providers/
+│   ├── base.py              # Abstract CloudProvider interface
+│   ├── azure_provider.py    # Azure implementation
+│   └── aws_provider.py      # AWS scaffold (coming soon)
 ├── scenarios/
 │   ├── registry.py          # Scenario registry with auto-discovery
-│   └── vm_identity_log_deletion.py  # First scenario
+│   ├── vm_identity_log_deletion.py  # Azure scenario
+│   ├── storage_data_exfil.py        # Azure scenario
+│   ├── iam_privilege_escalation.py  # Azure scenario
+│   └── aws_s3_public_bucket.py      # AWS scenario (scaffold)
 ├── validators/
 │   ├── base.py              # Abstract validator interface
 │   ├── cortex_xdr.py        # Cortex XDR API validator
@@ -209,6 +254,7 @@ Each run generates reports in `azure_cortex_orchestrator/reports/{run_id}/`:
 
 - `report.md` — Human-readable Markdown with ATT&CK mapping, timeline, and verdict
 - `report.json` — Machine-readable JSON with full state data
+- `attack_navigator_layer.json` — MITRE ATT&CK Navigator layer — import into the [Navigator](https://mitre-attack.github.io/attack-navigator/) to visualize technique coverage and detection gaps
 - `execution.log` — Structured JSON log of the entire run
 
 ## Safety

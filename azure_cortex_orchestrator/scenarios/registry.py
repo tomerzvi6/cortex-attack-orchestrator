@@ -22,7 +22,7 @@ class SimulationStep:
     order: int
     name: str
     description: str
-    azure_sdk_action: str  # e.g. "monitor.diagnostic_settings.delete"
+    sdk_action: str  # e.g. "monitor.diagnostic_settings.delete" or "s3.list_buckets"
     target_resource_type: str  # e.g. "Microsoft.Insights/diagnosticSettings"
     parameters: dict[str, Any] = field(default_factory=dict)
 
@@ -59,6 +59,9 @@ class Scenario:
     # Detection expectations
     detection_expectations: dict[str, Any] = field(default_factory=dict)
     # Keys: expected_activity_log_operations, expected_alert_types, etc.
+
+    # Cloud provider target ("azure", "aws", "gcp", …)
+    cloud_provider: str = "azure"
 
 
 class ScenarioRegistry:

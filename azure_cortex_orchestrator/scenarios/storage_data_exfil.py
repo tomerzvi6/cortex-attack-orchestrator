@@ -91,7 +91,7 @@ SCENARIO = Scenario(
             description=(
                 "Authenticate using the storage account access keys."
             ),
-            azure_sdk_action="storage.authenticate",
+            sdk_action="storage.authenticate",
             target_resource_type="Microsoft.Storage/storageAccounts",
         ),
         SimulationStep(
@@ -100,7 +100,7 @@ SCENARIO = Scenario(
             description=(
                 "List all blob containers in the storage account."
             ),
-            azure_sdk_action="storage.containers.list",
+            sdk_action="storage.containers.list",
             target_resource_type="Microsoft.Storage/storageAccounts/blobServices/containers",
         ),
         SimulationStep(
@@ -110,7 +110,7 @@ SCENARIO = Scenario(
                 "Enumerate blobs in the target container to find "
                 "sensitive data."
             ),
-            azure_sdk_action="storage.blobs.list",
+            sdk_action="storage.blobs.list",
             target_resource_type="Microsoft.Storage/storageAccounts/blobServices/containers/blobs",
         ),
         SimulationStep(
@@ -119,7 +119,7 @@ SCENARIO = Scenario(
             description=(
                 "Download blob data (simulating exfiltration)."
             ),
-            azure_sdk_action="storage.blobs.download",
+            sdk_action="storage.blobs.download",
             target_resource_type="Microsoft.Storage/storageAccounts/blobServices/containers/blobs",
         ),
         SimulationStep(
@@ -128,7 +128,7 @@ SCENARIO = Scenario(
             description=(
                 "Generate an account-level SAS token for persistent access."
             ),
-            azure_sdk_action="storage.account.generateSas",
+            sdk_action="storage.account.generateSas",
             target_resource_type="Microsoft.Storage/storageAccounts",
         ),
     ],

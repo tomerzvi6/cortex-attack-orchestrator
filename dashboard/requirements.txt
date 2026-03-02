@@ -1,0 +1,2 @@
+# Dashboard dependencies (in addition to the project's requirements.txt)
+streamlit>=1.30.0

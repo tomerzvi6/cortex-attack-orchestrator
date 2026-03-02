@@ -90,7 +90,7 @@ SCENARIO = Scenario(
                 "Authenticate using the service principal with the "
                 "custom role."
             ),
-            azure_sdk_action="identity.authenticate",
+            sdk_action="identity.authenticate",
             target_resource_type="Microsoft.ManagedIdentity",
         ),
         SimulationStep(
@@ -100,7 +100,7 @@ SCENARIO = Scenario(
                 "List current role assignments and permissions to "
                 "discover escalation path."
             ),
-            azure_sdk_action="authorization.role_assignments.list",
+            sdk_action="authorization.role_assignments.list",
             target_resource_type="Microsoft.Authorization/roleAssignments",
         ),
         SimulationStep(
@@ -109,7 +109,7 @@ SCENARIO = Scenario(
             description=(
                 "Enumerate available role definitions including Owner."
             ),
-            azure_sdk_action="authorization.role_definitions.list",
+            sdk_action="authorization.role_definitions.list",
             target_resource_type="Microsoft.Authorization/roleDefinitions",
         ),
         SimulationStep(
@@ -119,7 +119,7 @@ SCENARIO = Scenario(
                 "Create a new role assignment granting Owner on the "
                 "subscription."
             ),
-            azure_sdk_action="authorization.role_assignments.create",
+            sdk_action="authorization.role_assignments.create",
             target_resource_type="Microsoft.Authorization/roleAssignments",
         ),
         SimulationStep(
@@ -129,7 +129,7 @@ SCENARIO = Scenario(
                 "Verify the Owner role is now assigned and enumerate "
                 "newly accessible resources."
             ),
-            azure_sdk_action="authorization.role_assignments.list",
+            sdk_action="authorization.role_assignments.list",
             target_resource_type="Microsoft.Authorization/roleAssignments",
         ),
     ],
