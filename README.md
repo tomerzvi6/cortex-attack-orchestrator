@@ -1,6 +1,6 @@
 # Azure-Cortex Orchestrator
 
-An agentic cloud attack simulation system built with **LangGraph**. It plans attacks using MITRE ATT&CK mappings, generates vulnerable Azure infrastructure via Terraform, executes simulated attacks using the Azure SDK, validates detection (via Cortex XDR or simulated rules), and produces structured reports.
+An agentic, multi-cloud attack simulation system built with **LangGraph**. It plans attacks using MITRE ATT&CK mappings, generates vulnerable cloud infrastructure (Azure / AWS) via Terraform, executes simulated attacks using cloud SDKs (Azure SDK, boto3), validates detection via Cortex XDR (with polling) or simulated rules, and produces structured reports.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ An agentic cloud attack simulation system built with **LangGraph**. It plans att
 │                                  ▼                  │         │
 │                       ┌──────────────────┐          │         │
 │                       │  safety_check    │          │         │
-│                       │  (guardrails)    │          │         │
+│                       │  (2-layer guard) │          │         │
 │                       └────────┬─────────┘          │         │
 │                     ┌──────────┼──────────┐         │         │
 │                     │          │          │         │         │
@@ -34,7 +34,7 @@ An agentic cloud attack simulation system built with **LangGraph**. It plans att
 │                                            ▼                  │
 │                                   ┌────────────────┐          │
 │                                   │execute_simulator│         │
-│                                   │(Azure SDK)      │         │
+│                                   │(Azure/AWS SDK) │          │
 │                                   └───────┬────────┘          │
 │                                           │                   │
 │                                           ▼                   │
@@ -51,6 +51,12 @@ An agentic cloud attack simulation system built with **LangGraph**. It plans att
 │                                           │                   │
 │                                           ▼                   │
 │                                   ┌────────────────┐          │
+│                                   │erasure_validator│         │
+│                                   │(verify cleanup) │         │
+│                                   └───────┬────────┘          │
+│                                           │                   │
+│                                           ▼                   │
+│                                   ┌────────────────┐          │
 │                                   │generate_report │          │
 │                                   │(Markdown+JSON) │          │
 │                                   └───────┬────────┘          │
@@ -62,22 +68,26 @@ An agentic cloud attack simulation system built with **LangGraph**. It plans att
 ## Features
 
 - **MITRE ATT&CK Mapping** — AI-powered attack planning with technique IDs
-- **Terraform IaC** — Auto-generated vulnerable Azure infrastructure
-- **Safety Guardrails** — Resource group prefix, subscription allowlist, resource count limits
-- **Pluggable Validators** — Cortex XDR API or simulated rule-based detection
-- **Scenario Registry** — Extensible framework; add new attack scenarios as plugins
+- **Multi-Cloud** — Azure and AWS scenarios with pluggable cloud provider layer
+- **Terraform IaC** — Auto-generated vulnerable cloud infrastructure
+- **Two-Layer Safety Guardrails** — Regex on HCL source + `terraform plan -json` resolved-value analysis (resource group prefix, subscription allowlist, dangerous-resource blocklist, resource count cap)
+- **Pluggable Validators** — Cortex XDR API (polling with exponential backoff) or simulated rule-based detection
+- **Scenario Registry** — Extensible plugin framework; add new attack scenarios by dropping a Python file
 - **Dry-Run Mode** — Test the full flow without deploying cloud resources
-- **Structured Reporting** — Markdown + JSON reports with timeline and ATT&CK mapping
+- **Structured Reporting** — Markdown + JSON reports with timeline, ATT&CK mapping, and Navigator layer
 - **Observability** — JSON-structured logging with per-run log files
-- **Auto-Teardown** — Infrastructure is automatically destroyed after validation
-- **Self-Healing Deploys** — Up to 3 retries with AI-assisted Terraform fix
+- **Auto-Teardown + Erasure Validation** — Infrastructure is destroyed after validation, then verified via cloud API
+- **Self-Healing Deploys** — Up to 3 retries with AI-assisted Terraform fix (re-checked by safety guardrails)
+- **Crash Recovery** — Persistent run manifest tracks deployment lifecycle; orphaned infrastructure is detected on startup
+- **OpenAI Resilience** — Exponential backoff and timeout on all LLM calls
 
 ## Prerequisites
 
 - **Python 3.10+**
 - **Terraform** (installed and on PATH)
-- **Azure Subscription** with a Service Principal
 - **OpenAI API Key**
+- For Azure scenarios: **Azure Subscription** with a Service Principal
+- For AWS scenarios: **AWS Account** with IAM access keys or role-based credentials
 - (Optional) **Cortex XDR** API key and FQDN
 
 ## Quick Start
@@ -108,25 +118,32 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 python -m azure_cortex_orchestrator.main --dry-run --scenario vm_identity_log_deletion
 ```
 
-This tests the full LangGraph flow: plan_attack → generate_infrastructure → safety_check → generate_report, without deploying anything to Azure.
+This tests the full LangGraph flow: plan_attack → generate_infrastructure → safety_check → generate_report, without deploying anything.
 
-### 5. Full live run
+### 5. Full live run (Azure)
 
 ```bash
 python -m azure_cortex_orchestrator.main --scenario vm_identity_log_deletion
 ```
 
-This will:
-1. Plan the attack (MITRE ATT&CK mapping via OpenAI)
-2. Generate Terraform for a vulnerable Azure environment
-3. Run safety guardrail checks
-4. Deploy infrastructure (with confirmation prompt)
-5. Execute the simulated attack (delete diagnostic settings)
-6. Validate detection (Cortex XDR or simulated)
-7. Tear down all infrastructure
-8. Generate a Markdown + JSON report
+### 6. Full live run (AWS)
 
-### 6. Custom goal
+```bash
+python -m azure_cortex_orchestrator.main --scenario aws_s3_public_bucket
+```
+
+A live run will:
+1. Plan the attack (MITRE ATT&CK mapping via OpenAI)
+2. Generate Terraform for a vulnerable cloud environment
+3. Run two-layer safety guardrail checks (regex + plan-JSON)
+4. Deploy infrastructure (with confirmation prompt)
+5. Execute the simulated attack via the cloud SDK (Azure SDK or boto3)
+6. Validate detection (Cortex XDR polling or simulated)
+7. Tear down all infrastructure
+8. Verify erasure (cloud API check for orphaned resources)
+9. Generate a Markdown + JSON report
+
+### 7. Custom goal
 
 ```bash
 python -m azure_cortex_orchestrator.main \
@@ -155,12 +172,13 @@ The dashboard provides:
 
 The orchestrator uses a **provider abstraction layer** (`cloud_providers/`) so that
 the same LangGraph graph, scenario definitions, and reporting pipeline can target
-multiple cloud platforms.
+multiple cloud platforms. The `execute_simulator` node dynamically dispatches actions
+through the appropriate cloud provider based on the scenario's `cloud_provider` field.
 
 | Provider | Status | Scenarios |
 |----------|--------|-----------|
 | **Azure** | ✅ Fully implemented | `vm_identity_log_deletion`, `storage_data_exfil`, `iam_privilege_escalation` |
-| **AWS** | 🔜 Scaffolded | `aws_s3_public_bucket` |
+| **AWS** | ✅ Fully implemented (boto3) | `aws_s3_public_bucket`, `aws_storage_data_exfil`, `aws_iam_privilege_escalation`, `aws_ec2_cloudtrail_deletion` |
 
 Each cloud provider implements the `CloudProvider` abstract base class
 (`cloud_providers/base.py`) which exposes:
@@ -176,29 +194,34 @@ Scenarios declare their target cloud via the `cloud_provider` field (default `"a
 
 ```
 azure_cortex_orchestrator/
-├── main.py                  # CLI entry point
+├── main.py                  # CLI entry point (with orphaned-run detection)
 ├── state.py                 # LangGraph state (TypedDict)
 ├── nodes.py                 # All graph node functions
 ├── graph.py                 # StateGraph construction & compilation
 ├── config.py                # Settings from env vars
 ├── cloud_providers/
 │   ├── base.py              # Abstract CloudProvider interface
-│   ├── azure_provider.py    # Azure implementation
-│   └── aws_provider.py      # AWS scaffold (coming soon)
+│   ├── azure_provider.py    # Azure SDK implementation
+│   └── aws_provider.py      # AWS boto3 implementation
 ├── scenarios/
 │   ├── registry.py          # Scenario registry with auto-discovery
-│   ├── vm_identity_log_deletion.py  # Azure scenario
-│   ├── storage_data_exfil.py        # Azure scenario
-│   ├── iam_privilege_escalation.py  # Azure scenario
-│   └── aws_s3_public_bucket.py      # AWS scenario (scaffold)
+│   ├── vm_identity_log_deletion.py     # Azure: delete activity logs
+│   ├── storage_data_exfil.py           # Azure: storage exfiltration
+│   ├── iam_privilege_escalation.py     # Azure: privilege escalation
+│   ├── aws_s3_public_bucket.py         # AWS: public bucket exposure
+│   ├── aws_storage_data_exfil.py       # AWS: S3 exfiltration via keys
+│   ├── aws_iam_privilege_escalation.py # AWS: IAM policy attachment
+│   └── aws_ec2_cloudtrail_deletion.py  # AWS: CloudTrail log deletion
 ├── validators/
 │   ├── base.py              # Abstract validator interface
-│   ├── cortex_xdr.py        # Cortex XDR API validator
-│   └── simulated.py         # Rule-based simulated validator
+│   ├── cortex_xdr.py        # Cortex XDR API validator (polling + backoff)
+│   ├── simulated.py         # Rule-based simulated validator
+│   └── erasure.py           # Post-teardown resource erasure verifier
 ├── utils/
 │   ├── observability.py     # Structured logging + tracing
-│   ├── terraform.py         # Terraform CLI wrapper
+│   ├── terraform.py         # Terraform CLI wrapper (incl. plan_json)
 │   ├── azure_helpers.py     # Azure SDK helpers
+│   ├── run_manifest.py      # Crash-recovery run manifest persistence
 │   └── reporting.py         # Report generation
 ├── templates/
 │   └── base_infra.tf.j2     # Jinja2 Terraform template
@@ -243,6 +266,9 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 | `AZURE_SUBSCRIPTION_ID` | Live runs | — | Target subscription |
 | `CORTEX_XDR_API_KEY` | No | — | Cortex XDR API key |
 | `CORTEX_XDR_FQDN` | No | — | Cortex XDR FQDN |
+| `AWS_ACCESS_KEY_ID` | AWS runs | — | AWS IAM access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS runs | — | AWS IAM secret key |
+| `AWS_DEFAULT_REGION` | No | `us-east-1` | AWS target region |
 | `RESOURCE_GROUP_PREFIX` | No | `cortex-sim-` | Safety: RG name prefix |
 | `ALLOWED_SUBSCRIPTIONS` | No | — | Safety: allowed sub IDs |
 | `MAX_TERRAFORM_RESOURCES` | No | `15` | Safety: max resource count |
@@ -259,14 +285,26 @@ Each run generates reports in `azure_cortex_orchestrator/reports/{run_id}/`:
 
 ## Safety
 
-The `safety_check` node enforces guardrails before any infrastructure is deployed:
+The `safety_check` node enforces guardrails through a **two-layer** approach before any infrastructure is deployed:
 
+**Layer 1 — Static HCL analysis (regex):**
 - Resource groups must use the configured prefix (`cortex-sim-` by default)
 - Subscription IDs must be in the allowlist (if configured)
 - No AAD / tenant-level resource modifications
 - Resource count cannot exceed the configured maximum
 
+**Layer 2 — Plan-JSON analysis (resolved values):**
+- Runs `terraform plan -json` and inspects the resolved `resource_changes`
+- Catches dynamic references and variable interpolation that regex misses
+- Validates resource group names, subscription scopes, and role assignment scopes from the plan output
+
 If any violation is detected, the graph skips deployment and generates a report with the violations listed.
+
+On deploy retries (self-healing), the AI-regenerated Terraform code is **re-checked by safety_check** before reaching `deploy_infrastructure` again.
+
+## Crash Recovery
+
+Each deployment writes a persistent **run manifest** (`reports/run-{id}.manifest.json`) tracking lifecycle state. On startup, the CLI scans for manifests where `deploy_status=success` but `teardown_completed=false` — indicating orphaned infrastructure from a previous crash. These are surfaced as warnings so the operator can manually recover or destroy.
 
 ## License
 
