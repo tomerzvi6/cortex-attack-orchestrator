@@ -137,6 +137,30 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Dry Run: %s", args.dry_run)
     log.info("=" * 60)
 
+    # ── Check for orphaned runs from previous crashes ─────────────
+    from azure_cortex_orchestrator.utils.run_manifest import RunManifest
+
+    orphaned_runs = RunManifest.find_incomplete_runs(settings.reports_dir)
+    if orphaned_runs:
+        log.warning(
+            "Found %d potentially orphaned run(s) with deployed "
+            "infrastructure that was never torn down:",
+            len(orphaned_runs),
+        )
+        for orphan in orphaned_runs:
+            log.warning(
+                "  - Run %s (scenario=%s, deployed=%s, tf_dir=%s)",
+                orphan.get("run_id", "?"),
+                orphan.get("scenario_id", "?"),
+                orphan.get("updated_at", "?"),
+                orphan.get("terraform_working_dir", "?"),
+            )
+        print(
+            f"\nWARNING: {len(orphaned_runs)} orphaned run(s) detected. "
+            "Use the manifest files to recover/destroy.",
+            file=sys.stderr,
+        )
+
     # ── Resolve scenario ──────────────────────────────────────────
     registry = ScenarioRegistry.get_instance()
     try:

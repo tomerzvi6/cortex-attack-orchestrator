@@ -92,6 +92,9 @@ class OrchestratorState(TypedDict, total=False):
     # ── Validation ────────────────────────────────────────────────
     validation_result: ValidationResult  # Detection verdict
 
+    # ── Erasure ───────────────────────────────────────────────────
+    erasure_result: dict[str, Any]       # Teardown completeness check
+
     # ── Reporting ─────────────────────────────────────────────────
     report_path: str                # Path to the generated report directory
     report: str                     # Full Markdown report content
@@ -121,6 +124,7 @@ def create_initial_state(
         safety_violations=[],
         simulation_results=[],
         validation_result={},
+        erasure_result={},
         report_path="",
         report="",
     )

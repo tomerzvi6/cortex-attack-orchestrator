@@ -144,6 +144,40 @@ class TerraformRunner:
         logger.info("terraform plan completed (exit_code=%d)", result.returncode)
         return result.stdout
 
+    def plan_json(self) -> dict:
+        """
+        Run ``terraform plan`` and return the structured JSON output.
+
+        Creates a plan file, then runs ``terraform show -json`` to
+        produce machine-readable output with resolved resource values.
+
+        Returns:
+            Parsed JSON dict of the plan.
+        """
+        import json as _json
+
+        if not self._initialized:
+            self.init()
+
+        plan_file = self.working_dir / "tfplan.bin"
+
+        logger.info("Running terraform plan -out (for JSON analysis)")
+        result = self._run(
+            ["plan", "-no-color", "-detailed-exitcode", f"-out={plan_file}"],
+            check=False,
+        )
+        if result.returncode == 1:
+            raise TerraformError("plan", result.returncode, result.stderr)
+
+        logger.info("Running terraform show -json on plan file")
+        show_result = self._run(["show", "-json", str(plan_file)])
+
+        try:
+            return _json.loads(show_result.stdout)
+        except _json.JSONDecodeError as exc:
+            logger.error("Failed to parse plan JSON: %s", exc)
+            return {}
+
     def apply(self, auto_approve: bool = False) -> str:
         """
         Run ``terraform apply``.

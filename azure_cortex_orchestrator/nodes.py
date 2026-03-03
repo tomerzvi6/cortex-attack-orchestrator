@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from azure_cortex_orchestrator.scenarios.registry import ScenarioRegistry
 from azure_cortex_orchestrator.state import OrchestratorState
 from azure_cortex_orchestrator.utils.observability import get_logger, node_logger
 from azure_cortex_orchestrator.utils.reporting import ReportGenerator
+from azure_cortex_orchestrator.utils.run_manifest import RunManifest
 from azure_cortex_orchestrator.utils.terraform import TerraformError, TerraformRunner
 
 # ── Module-level setup ────────────────────────────────────────────
@@ -52,20 +54,64 @@ def _call_openai(
     model: str | None = None,
     temperature: float = 0.2,
     max_tokens: int = 4096,
+    *,
+    max_retries: int = 3,
+    timeout_seconds: int = 120,
 ) -> str:
-    """Helper to call OpenAI chat completions."""
+    """
+    Call OpenAI chat completions with exponential backoff and timeout.
+
+    Retries on transient errors (rate limits, server errors, timeouts).
+    Raises after ``max_retries`` failures.
+    """
     client = _get_openai_client()
     settings = _get_settings()
-    response = client.chat.completions.create(
-        model=model or settings.openai_model,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return response.choices[0].message.content or ""
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model or settings.openai_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=temperature,
+                max_tokens=max_tokens,
+                timeout=timeout_seconds,
+            )
+            return response.choices[0].message.content or ""
+
+        except Exception as exc:
+            last_exc = exc
+            # Classify the error
+            err_str = str(exc).lower()
+            is_transient = any(
+                keyword in err_str
+                for keyword in [
+                    "rate limit", "429", "timeout", "timed out",
+                    "server error", "500", "502", "503", "overloaded",
+                    "connection", "temporarily",
+                ]
+            )
+
+            if not is_transient or attempt == max_retries:
+                logger.error(
+                    "OpenAI call failed (attempt %d/%d, non-retriable): %s",
+                    attempt, max_retries, exc,
+                )
+                raise
+
+            # Exponential backoff: 2s, 4s, 8s, ...
+            backoff = 2 ** attempt
+            logger.warning(
+                "OpenAI call failed (attempt %d/%d), retrying in %ds: %s",
+                attempt, max_retries, backoff, exc,
+            )
+            time.sleep(backoff)
+
+    # Should not reach here, but safeguard
+    raise last_exc or RuntimeError("OpenAI call failed after retries")
 
 
 def _extract_json(text: str) -> dict[str, Any]:
@@ -332,16 +378,29 @@ def safety_check(state: OrchestratorState) -> dict[str, Any]:
     """
     Node: Validate the Terraform plan against safety guardrails.
 
+    Two-layer approach:
+    Layer 1 (always): Regex-based static analysis of HCL source.
+    Layer 2 (when possible): ``terraform plan -json`` for resolved values.
+
     Checks:
-    1. Resource group name starts with the configured prefix.
+    1. Resource group / naming prefix.
     2. Subscription ID is in the allowlist (if configured).
     3. No tenant-level or AAD operations.
     4. Resource count doesn't exceed the maximum.
+    5. (Plan JSON) Resolved values — catches dynamic refs and variables.
     """
     with node_logger("safety_check", state.get("run_id", "")) as log:
         settings = _get_settings()
         terraform_code = state.get("terraform_code", "")
+        deploy_retries = state.get("deploy_retries", 0)
         violations: list[str] = []
+
+        if deploy_retries > 0:
+            log.info(
+                "Re-running safety check after deploy retry #%d "
+                "(AI-regenerated Terraform code)",
+                deploy_retries,
+            )
 
         if not terraform_code:
             violations.append("No Terraform code generated")
@@ -349,6 +408,8 @@ def safety_check(state: OrchestratorState) -> dict[str, Any]:
                 "safety_violations": violations,
                 "deploy_status": "unsafe",
             }
+
+        # ── Layer 1: Regex-based HCL source analysis ──────────────
 
         # Check 1: Resource group prefix
         rg_pattern = re.findall(
@@ -399,6 +460,12 @@ def safety_check(state: OrchestratorState) -> dict[str, Any]:
                 f"({settings.max_terraform_resources})"
             )
 
+        # ── Layer 2: Plan-JSON analysis (resolved values) ─────────
+        # Only run if Layer 1 passed and we're not in dry-run mode
+        if not violations and not state.get("dry_run", False):
+            plan_violations = _safety_check_plan_json(state, settings, log)
+            violations.extend(plan_violations)
+
         if violations:
             log.warning("Safety violations found: %s", violations)
             return {
@@ -411,6 +478,113 @@ def safety_check(state: OrchestratorState) -> dict[str, Any]:
             "safety_violations": [],
             "deploy_status": "pending",
         }
+
+
+def _safety_check_plan_json(
+    state: OrchestratorState,
+    settings: Settings,
+    log: Any,
+) -> list[str]:
+    """
+    Run ``terraform plan -json`` and validate the resolved plan.
+
+    Returns a list of safety violations found in the plan output.
+    """
+    violations: list[str] = []
+    run_id = state.get("run_id", "unknown")
+    terraform_code = state.get("terraform_code", "")
+
+    try:
+        tf_runner = TerraformRunner(
+            run_id=run_id,
+            base_tmp_dir=settings.terraform_tmp_dir,
+            azure_env={
+                "ARM_CLIENT_ID": settings.azure_client_id,
+                "ARM_CLIENT_SECRET": settings.azure_client_secret,
+                "ARM_TENANT_ID": settings.azure_tenant_id,
+                "ARM_SUBSCRIPTION_ID": settings.azure_subscription_id,
+            },
+        )
+        tf_runner.write_tf_files(terraform_code)
+        plan_data = tf_runner.plan_json()
+
+        if not plan_data:
+            log.warning("Plan JSON was empty — skipping Layer 2 checks")
+            return violations
+
+        # Analyze planned resource changes
+        resource_changes = plan_data.get("resource_changes", [])
+        log.info("Plan JSON: %d resource changes to analyze", len(resource_changes))
+
+        for rc in resource_changes:
+            resource_type = rc.get("type", "")
+            change = rc.get("change", {})
+            after = change.get("after", {}) or {}
+
+            # Check: resolved resource group names
+            if resource_type == "azurerm_resource_group":
+                name = after.get("name", "")
+                if name and not name.startswith(settings.resource_group_prefix):
+                    violations.append(
+                        f"[plan-json] Resource group '{name}' does not "
+                        f"start with prefix '{settings.resource_group_prefix}'"
+                    )
+
+            # Check: resolved subscription references in scope fields
+            scope = after.get("scope", "")
+            if scope and "/subscriptions/" in scope:
+                import re as _re
+                sub_match = _re.search(r'/subscriptions/([a-f0-9-]+)', scope, _re.IGNORECASE)
+                if sub_match and settings.allowed_subscriptions:
+                    sub_id = sub_match.group(1)
+                    if sub_id not in settings.allowed_subscriptions:
+                        violations.append(
+                            f"[plan-json] Resource targets subscription "
+                            f"'{sub_id}' which is not in the allowed list"
+                        )
+
+            # Check: dangerous resource types in resolved plan
+            dangerous_types = [
+                "azuread_", "azurerm_management_group",
+                "azurerm_tenant_", "azurerm_policy_definition",
+            ]
+            for dangerous in dangerous_types:
+                if resource_type.startswith(dangerous):
+                    violations.append(
+                        f"[plan-json] Dangerous resource type in plan: "
+                        f"'{resource_type}'"
+                    )
+
+            # Check: role assignments at management-group or tenant scope
+            if resource_type in ("azurerm_role_assignment", "aws_iam_policy_attachment"):
+                scope_val = after.get("scope", "")
+                if "managementGroups" in scope_val or "tenant" in scope_val.lower():
+                    violations.append(
+                        f"[plan-json] Role assignment at dangerous scope: "
+                        f"'{scope_val}'"
+                    )
+
+        # Check: total resource count from plan
+        create_count = sum(
+            1 for rc in resource_changes
+            if "create" in rc.get("change", {}).get("actions", [])
+        )
+        if create_count > settings.max_terraform_resources:
+            violations.append(
+                f"[plan-json] Plan creates {create_count} resources, "
+                f"exceeding maximum ({settings.max_terraform_resources})"
+            )
+
+    except TerraformError as exc:
+        log.warning(
+            "Terraform plan failed during safety check (non-blocking): %s",
+            str(exc)[:300],
+        )
+        # Plan failure here is not a safety violation — deploy will catch it
+    except Exception as exc:
+        log.warning("Plan-JSON safety check encountered an error: %s", exc)
+
+    return violations
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -455,6 +629,25 @@ def deploy_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             tf_runner.apply(auto_approve=False)
 
             log.info("Infrastructure deployed successfully")
+
+            # Persist run manifest so orphaned infra can be recovered
+            manifest = RunManifest(
+                manifest_dir=settings.reports_dir,
+                run_id=run_id,
+            )
+            scenario_id = state.get("scenario_id", "")
+            try:
+                registry = ScenarioRegistry.get_instance()
+                cloud = registry.get(scenario_id).cloud_provider
+            except KeyError:
+                cloud = "azure"
+            manifest.update(scenario_id=scenario_id)
+            manifest.mark_deployed(
+                terraform_working_dir=str(tf_runner.working_dir),
+                terraform_code=tf_code,
+                cloud_provider=cloud,
+            )
+
             return {
                 "deploy_status": "success",
                 "deploy_error": "",
@@ -497,126 +690,162 @@ def deploy_infrastructure(state: OrchestratorState) -> dict[str, Any]:
 
 def execute_simulator(state: OrchestratorState) -> dict[str, Any]:
     """
-    Node: Execute the attack simulation using Azure SDK.
+    Node: Execute the attack simulation dynamically using the scenario's
+    declared simulation_steps and the appropriate cloud provider.
 
-    For the vm_identity_log_deletion scenario:
-    1. Authenticate with service principal (simulating Managed Identity)
-    2. List subscription resources (demonstrate Contributor access)
-    3. List diagnostic settings
-    4. Delete diagnostic settings (the attack)
-    5. Verify deletion
+    Steps are dispatched via CloudProvider.execute_action(), making this
+    node scenario-agnostic. Each step from the scenario definition is
+    executed in order, results are recorded with timestamps.
     """
     with node_logger("execute_simulator", state.get("run_id", "")) as log:
         settings = _get_settings()
         scenario_id = state.get("scenario_id", "")
         results: list[dict[str, Any]] = []
 
-        def _record(action: str, target: str, result: str, details: str = "", error: str | None = None) -> None:
+        # ── Load scenario and resolve cloud provider ──────────────
+        try:
+            registry = ScenarioRegistry.get_instance()
+            scenario = registry.get(scenario_id)
+        except KeyError:
+            log.error("Scenario '%s' not found — cannot execute simulation", scenario_id)
             results.append({
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "action": action,
-                "target_resource": target,
-                "result": result,
-                "details": details,
-                "error": error,
+                "action": "load_scenario",
+                "target_resource": scenario_id,
+                "result": "failed",
+                "details": "",
+                "error": f"Scenario '{scenario_id}' not found in registry",
             })
+            return {"simulation_results": results}
 
+        cloud = scenario.cloud_provider or "azure"
+        log.info(
+            "Executing simulation for scenario '%s' (cloud=%s, %d steps)",
+            scenario_id, cloud, len(scenario.simulation_steps),
+        )
+
+        # ── Resolve cloud provider implementation ─────────────────
+        from azure_cortex_orchestrator.cloud_providers.azure_provider import AzureCloudProvider
+        from azure_cortex_orchestrator.cloud_providers.aws_provider import AWSCloudProvider
+
+        providers = {
+            "azure": AzureCloudProvider,
+            "aws": AWSCloudProvider,
+        }
+        provider_cls = providers.get(cloud)
+        if provider_cls is None:
+            log.error("Unsupported cloud provider: %s", cloud)
+            results.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "resolve_provider",
+                "target_resource": cloud,
+                "result": "failed",
+                "details": "",
+                "error": f"Unsupported cloud provider: '{cloud}'. Supported: {list(providers)}",
+            })
+            return {"simulation_results": results}
+
+        provider = provider_cls()
+
+        # ── Authenticate ──────────────────────────────────────────
         try:
-            # Step 1: Authenticate
-            log.info("Step 1: Authenticating as service principal")
-            from azure_cortex_orchestrator.utils.azure_helpers import (
-                get_credential,
-                get_monitor_client,
-                get_resource_client,
+            provider.authenticate(settings)
+            results.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "authenticate",
+                "target_resource": cloud,
+                "result": "success",
+                "details": f"Authenticated to {cloud}",
+                "error": None,
+            })
+        except NotImplementedError:
+            log.error(
+                "Cloud provider '%s' authentication is not yet implemented", cloud
+            )
+            results.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "authenticate",
+                "target_resource": cloud,
+                "result": "failed",
+                "details": "",
+                "error": f"Cloud provider '{cloud}' authentication not implemented",
+            })
+            return {"simulation_results": results}
+        except Exception as exc:
+            log.error("Authentication failed for '%s': %s", cloud, exc)
+            results.append({
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "action": "authenticate",
+                "target_resource": cloud,
+                "result": "failed",
+                "details": "",
+                "error": str(exc),
+            })
+            return {"simulation_results": results}
+
+        # ── Execute each simulation step ──────────────────────────
+        for step in sorted(scenario.simulation_steps, key=lambda s: s.order):
+            log.info(
+                "Step %d/%d: %s — %s",
+                step.order,
+                len(scenario.simulation_steps),
+                step.name,
+                step.sdk_action,
             )
 
-            credential = get_credential(settings)
-            _record(
-                "authenticate",
-                "ServicePrincipal",
-                "success",
-                f"Authenticated as client_id={settings.azure_client_id}",
-            )
+            try:
+                result = provider.execute_action(
+                    action=step.sdk_action,
+                    target_resource_type=step.target_resource_type,
+                    parameters=step.parameters,
+                )
+                # Enrich the result with step metadata
+                result["step_name"] = step.name
+                result["step_order"] = step.order
+                result["step_description"] = step.description
+                results.append(result)
 
-            # Step 2: Enumerate resources
-            log.info("Step 2: Enumerating subscription resources")
-            resource_client = get_resource_client(settings)
-            resources = list(resource_client.resources.list())
-            resource_names = [r.name for r in resources[:10]]
-            _record(
-                "enumerate_resources",
-                f"/subscriptions/{settings.azure_subscription_id}",
-                "success",
-                f"Found {len(resources)} resources. Sample: {resource_names}",
-            )
-
-            # Step 3: List diagnostic settings
-            log.info("Step 3: Listing diagnostic settings")
-            monitor_client = get_monitor_client(settings)
-            sub_resource_id = f"/subscriptions/{settings.azure_subscription_id}"
-
-            diag_settings = list(
-                monitor_client.diagnostic_settings.list(sub_resource_id)
-            )
-            diag_names = [ds.name for ds in diag_settings]
-            _record(
-                "list_diagnostic_settings",
-                sub_resource_id,
-                "success",
-                f"Found {len(diag_settings)} diagnostic settings: {diag_names}",
-            )
-
-            # Step 4: Delete diagnostic settings
-            log.info("Step 4: Deleting diagnostic settings (THE ATTACK)")
-            deleted_count = 0
-            for ds in diag_settings:
-                if "cortex-sim" in (ds.name or "") or "activity-log" in (ds.name or "").lower():
-                    try:
-                        monitor_client.diagnostic_settings.delete(
-                            resource_uri=sub_resource_id,
-                            name=ds.name,
-                        )
-                        deleted_count += 1
-                        _record(
-                            "delete_diagnostic_setting",
-                            f"{sub_resource_id}/diagnosticSettings/{ds.name}",
-                            "success",
-                            f"Deleted diagnostic setting: {ds.name}",
-                        )
-                        log.warning("ATTACK ACTION: Deleted diagnostic setting '%s'", ds.name)
-                    except Exception as exc:
-                        _record(
-                            "delete_diagnostic_setting",
-                            f"{sub_resource_id}/diagnosticSettings/{ds.name}",
-                            "failed",
-                            error=str(exc),
-                        )
-
-            if deleted_count == 0:
-                _record(
-                    "delete_diagnostic_setting",
-                    sub_resource_id,
-                    "skipped",
-                    "No matching diagnostic settings found to delete",
+                log.info(
+                    "  → %s: %s",
+                    result.get("result", "unknown"),
+                    result.get("details", "")[:200],
                 )
 
-            # Step 5: Verify deletion
-            log.info("Step 5: Verifying diagnostic settings deletion")
-            remaining = list(
-                monitor_client.diagnostic_settings.list(sub_resource_id)
-            )
-            remaining_names = [ds.name for ds in remaining]
-            _record(
-                "verify_deletion",
-                sub_resource_id,
-                "success",
-                f"Remaining diagnostic settings: {remaining_names}. "
-                f"Deleted {deleted_count} settings.",
-            )
+                if result.get("result") == "failed":
+                    log.warning(
+                        "Step %d (%s) failed: %s",
+                        step.order, step.name, result.get("error", ""),
+                    )
 
-        except Exception as exc:
-            log.error("Simulation failed: %s", exc)
-            _record("simulation_error", "", "failed", error=str(exc))
+            except NotImplementedError:
+                log.error(
+                    "Action '%s' not implemented for provider '%s'",
+                    step.sdk_action, cloud,
+                )
+                results.append({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action": step.sdk_action,
+                    "target_resource": step.target_resource_type,
+                    "result": "failed",
+                    "details": step.description,
+                    "error": f"Action not implemented for provider '{cloud}'",
+                    "step_name": step.name,
+                    "step_order": step.order,
+                    "step_description": step.description,
+                })
+            except Exception as exc:
+                log.error("Step %d (%s) raised exception: %s", step.order, step.name, exc)
+                results.append({
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "action": step.sdk_action,
+                    "target_resource": step.target_resource_type,
+                    "result": "failed",
+                    "details": step.description,
+                    "error": str(exc),
+                    "step_name": step.name,
+                    "step_order": step.order,
+                    "step_description": step.description,
+                })
 
         log.info("Simulation completed with %d actions", len(results))
         return {"simulation_results": results}
@@ -688,6 +917,14 @@ def teardown(state: OrchestratorState) -> dict[str, Any]:
         try:
             output = tf_runner.destroy(auto_approve=True)
             log.info("Infrastructure destroyed successfully")
+
+            # Update run manifest to reflect successful teardown
+            manifest = RunManifest(
+                manifest_dir=settings.reports_dir,
+                run_id=run_id,
+            )
+            manifest.mark_teardown_complete()
+
         except TerraformError as exc:
             log.error("Teardown failed: %s", exc)
         except Exception as exc:
@@ -696,6 +933,63 @@ def teardown(state: OrchestratorState) -> dict[str, Any]:
             tf_runner.cleanup()
 
         return {}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NODE: erasure_validator
+# ══════════════════════════════════════════════════════════════════
+
+def erasure_validator(state: OrchestratorState) -> dict[str, Any]:
+    """
+    Node: Verify that all cloud resources deployed during the simulation
+    have been fully destroyed after teardown.
+
+    Checks:
+    1. Terraform state file for residual resources.
+    2. Azure API for lingering resource groups (Azure scenarios).
+    3. Logs any orphaned resources for the report.
+    """
+    with node_logger("erasure_validator", state.get("run_id", "")) as log:
+        settings = _get_settings()
+
+        if state.get("dry_run", False):
+            log.info("Dry run — skipping erasure validation.")
+            return {
+                "erasure_result": {
+                    "fully_erased": True,
+                    "orphaned_resources": [],
+                    "details": "Dry run — no resources were deployed.",
+                },
+            }
+
+        from azure_cortex_orchestrator.validators.erasure import validate_erasure
+
+        result = validate_erasure(state, settings)
+
+        log.info(
+            "Erasure validation: fully_erased=%s, orphaned=%d",
+            result.fully_erased,
+            len(result.orphaned_resources),
+        )
+
+        if not result.fully_erased:
+            log.warning(
+                "TEARDOWN INCOMPLETE — %d orphaned resource(s) detected: %s",
+                len(result.orphaned_resources),
+                result.details,
+            )
+
+        # Update run manifest with erasure result
+        try:
+            manifest = RunManifest(
+                manifest_dir=settings.reports_dir,
+                run_id=state.get("run_id", "unknown"),
+            )
+            manifest.mark_erasure_validated(result.fully_erased)
+        except Exception as exc:
+            log.warning("Failed to update run manifest: %s", exc)
+
+        return {"erasure_result": result.to_dict()}
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -13,13 +13,19 @@ Defines the StateGraph with all nodes and conditional edges:
          └─ else                  → deploy_infrastructure
       → [conditional: deploy result]
          ├─ success               → execute_simulator
-         ├─ failed & retries < 3  → generate_infrastructure (retry)
+         ├─ failed & retries < 3  → generate_infrastructure → safety_check (re-validated) → deploy
          └─ retries >= 3          → teardown_on_failure → generate_report → END
       → execute_simulator
       → validator
       → teardown
+      → erasure_validator   ← verifies all cloud resources were fully destroyed
       → generate_report
       → END
+
+NOTE: On every deploy retry, the AI-regenerated Terraform code is
+re-checked by safety_check before it reaches deploy_infrastructure
+again. This ensures that AI self-corrections don't introduce
+safety violations.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ from langgraph.graph import END, START, StateGraph
 
 from azure_cortex_orchestrator.nodes import (
     deploy_infrastructure,
+    erasure_validator,
     execute_simulator,
     generate_infrastructure,
     generate_report,
@@ -104,6 +111,7 @@ def build_graph() -> StateGraph:
     graph.add_node("execute_simulator", execute_simulator)
     graph.add_node("validator", validator)
     graph.add_node("teardown", teardown)
+    graph.add_node("erasure_validator", erasure_validator)
     graph.add_node("generate_report", generate_report)
 
     # ── Add edges ─────────────────────────────────────────────────
@@ -134,10 +142,11 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # Linear flow: simulator → validator → teardown → report → END
+    # Linear flow: simulator → validator → teardown → erasure_validator → report → END
     graph.add_edge("execute_simulator", "validator")
     graph.add_edge("validator", "teardown")
-    graph.add_edge("teardown", "generate_report")
+    graph.add_edge("teardown", "erasure_validator")
+    graph.add_edge("erasure_validator", "generate_report")
     graph.add_edge("generate_report", END)
 
     return graph
