@@ -18,6 +18,7 @@ env/
 *.tfstate.backup
 .terraform/
 .terraform.lock.hcl
+tmp/
 
 # Reports / generated output
 azure_cortex_orchestrator/reports/*

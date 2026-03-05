@@ -28,7 +28,7 @@ class Settings:
 
     # ── OpenAI ────────────────────────────────────────────────────
     openai_api_key: str = ""
-    openai_model: str = "gpt-4"
+    openai_model: str = "gpt-4o-mini-mini"
 
     # ── Azure Service Principal ───────────────────────────────────
     azure_client_id: str = ""
@@ -93,7 +93,7 @@ def load_settings() -> Settings:
     return Settings(
         # OpenAI
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
-        openai_model=os.environ.get("OPENAI_MODEL", "gpt-4"),
+        openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
         # Azure
         azure_client_id=os.environ.get("AZURE_CLIENT_ID", ""),
         azure_client_secret=os.environ.get("AZURE_CLIENT_SECRET", ""),

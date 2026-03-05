@@ -32,6 +32,19 @@ class AttackPlan(TypedDict, total=False):
     summary: str
 
 
+class LLMUsageRecord(TypedDict, total=False):
+    """Token and cost metrics for a single LLM call."""
+
+    node: str                # Which graph node made the call
+    model: str               # Model used (e.g. "gpt-4o-mini")
+    prompt_tokens: int       # Tokens in the prompt
+    completion_tokens: int   # Tokens in the completion
+    total_tokens: int        # prompt_tokens + completion_tokens
+    estimated_cost_usd: float  # Estimated cost based on model pricing
+    duration_ms: float       # Wall-clock time for the API call
+    timestamp: str           # ISO-8601 timestamp of the call
+
+
 class SimulationAction(TypedDict, total=False):
     """A single action executed during the simulation."""
 
@@ -95,6 +108,9 @@ class OrchestratorState(TypedDict, total=False):
     # ── Erasure ───────────────────────────────────────────────────
     erasure_result: dict[str, Any]       # Teardown completeness check
 
+    # ── LLM Observability ──────────────────────────────────────────
+    llm_usage: list[LLMUsageRecord]  # Token/cost metrics per LLM call
+
     # ── Reporting ─────────────────────────────────────────────────
     report_path: str                # Path to the generated report directory
     report: str                     # Full Markdown report content
@@ -125,6 +141,7 @@ def create_initial_state(
         simulation_results=[],
         validation_result={},
         erasure_result={},
+        llm_usage=[],
         report_path="",
         report="",
     )

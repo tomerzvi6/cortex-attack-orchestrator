@@ -44,8 +44,6 @@ class ReportGenerator:
 
         md = self._generate_markdown(state)
         json_data = self._generate_json(state)
-
-        # Write files
         navigator_layer = self._generate_attack_navigator_layer(state)
 
         # Write files
@@ -177,6 +175,37 @@ class ReportGenerator:
             lines.append("*No self-healing attempts were needed.*")
         lines.append("")
 
+        # ── LLM Observability ─────────────────────────────────────
+        llm_usage = state.get("llm_usage", [])
+        lines.append("## LLM Observability")
+        lines.append("")
+        if llm_usage:
+            total_tokens_all = sum(r.get("total_tokens", 0) for r in llm_usage)
+            total_cost_all = sum(r.get("estimated_cost_usd", 0.0) for r in llm_usage)
+            total_duration_all = sum(r.get("duration_ms", 0.0) for r in llm_usage)
+            lines.append(
+                f"**{len(llm_usage)}** LLM call(s) — "
+                f"**{total_tokens_all:,}** total tokens — "
+                f"**${total_cost_all:.4f}** estimated cost — "
+                f"**{total_duration_all:,.0f} ms** total latency"
+            )
+            lines.append("")
+            lines.append("| Node | Model | Prompt Tokens | Completion Tokens | Total | Cost (USD) | Latency |")
+            lines.append("|---|---|---:|---:|---:|---:|---|")
+            for r in llm_usage:
+                lines.append(
+                    f"| {r.get('node', '?')} "
+                    f"| {r.get('model', '?')} "
+                    f"| {r.get('prompt_tokens', 0):,} "
+                    f"| {r.get('completion_tokens', 0):,} "
+                    f"| {r.get('total_tokens', 0):,} "
+                    f"| ${r.get('estimated_cost_usd', 0.0):.4f} "
+                    f"| {r.get('duration_ms', 0.0):,.0f} ms |"
+                )
+        else:
+            lines.append("*No LLM calls were recorded.*")
+        lines.append("")
+
         # ── Simulation Timeline ───────────────────────────────────
         lines.append("## Simulation Timeline")
         lines.append("")
@@ -256,6 +285,31 @@ class ReportGenerator:
 
         return "\n".join(lines)
 
+    def _llm_usage_summary(self, state: OrchestratorState) -> dict[str, Any]:
+        """Compute aggregate LLM usage statistics for the JSON report."""
+        llm_usage = state.get("llm_usage", [])
+        if not llm_usage:
+            return {
+                "total_calls": 0,
+                "total_tokens": 0,
+                "total_prompt_tokens": 0,
+                "total_completion_tokens": 0,
+                "total_estimated_cost_usd": 0.0,
+                "total_duration_ms": 0.0,
+            }
+        return {
+            "total_calls": len(llm_usage),
+            "total_tokens": sum(r.get("total_tokens", 0) for r in llm_usage),
+            "total_prompt_tokens": sum(r.get("prompt_tokens", 0) for r in llm_usage),
+            "total_completion_tokens": sum(r.get("completion_tokens", 0) for r in llm_usage),
+            "total_estimated_cost_usd": round(
+                sum(r.get("estimated_cost_usd", 0.0) for r in llm_usage), 6,
+            ),
+            "total_duration_ms": round(
+                sum(r.get("duration_ms", 0.0) for r in llm_usage), 2,
+            ),
+        }
+
     def _generate_attack_navigator_layer(self, state: OrchestratorState) -> dict[str, Any]:
         """
         Produce a JSON structure compatible with MITRE ATT&CK Navigator.
@@ -324,6 +378,10 @@ class ReportGenerator:
             },
             "simulation_results": state.get("simulation_results", []),
             "validation_result": validation_result,
+            "llm_usage": {
+                "calls": state.get("llm_usage", []),
+                "summary": self._llm_usage_summary(state),
+            },
             "risk_level": risk_level,
             "attack_navigator_layer": self._generate_attack_navigator_layer(state),
         }

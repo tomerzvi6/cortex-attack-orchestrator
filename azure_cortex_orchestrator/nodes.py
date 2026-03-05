@@ -16,10 +16,17 @@ from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 from openai import OpenAI
+from pydantic import ValidationError
 
 from azure_cortex_orchestrator.config import Settings, load_settings
+from azure_cortex_orchestrator.models import AttackPlanResponse
+from azure_cortex_orchestrator.prompts import (
+    FIX_TERRAFORM_SYSTEM_PROMPT,
+    GENERATE_INFRA_SYSTEM_PROMPT,
+    PLAN_ATTACK_SYSTEM_PROMPT,
+)
 from azure_cortex_orchestrator.scenarios.registry import ScenarioRegistry
-from azure_cortex_orchestrator.state import OrchestratorState
+from azure_cortex_orchestrator.state import LLMUsageRecord, OrchestratorState
 from azure_cortex_orchestrator.utils.observability import get_logger, node_logger
 from azure_cortex_orchestrator.utils.reporting import ReportGenerator
 from azure_cortex_orchestrator.utils.run_manifest import RunManifest
@@ -55,23 +62,41 @@ def _call_openai(
     temperature: float = 0.2,
     max_tokens: int = 4096,
     *,
+    node_name: str = "",
+    json_mode: bool = False,
     max_retries: int = 3,
     timeout_seconds: int = 120,
-) -> str:
+) -> tuple[str, LLMUsageRecord]:
     """
     Call OpenAI chat completions with exponential backoff and timeout.
+
+    Args:
+        json_mode: When True, sets ``response_format={"type": "json_object"}``
+            so the model is guaranteed to return valid JSON (no markdown
+            fences needed).
+
+    Returns:
+        Tuple of (response_text, usage_record) where usage_record
+        contains token counts, cost estimate, and timing.
 
     Retries on transient errors (rate limits, server errors, timeouts).
     Raises after ``max_retries`` failures.
     """
     client = _get_openai_client()
     settings = _get_settings()
+    resolved_model = model or settings.openai_model
+
+    # Build optional kwargs
+    extra_kwargs: dict[str, Any] = {}
+    if json_mode:
+        extra_kwargs["response_format"] = {"type": "json_object"}
 
     last_exc: Exception | None = None
     for attempt in range(1, max_retries + 1):
         try:
+            call_start = time.perf_counter()
             response = client.chat.completions.create(
-                model=model or settings.openai_model,
+                model=resolved_model,
                 messages=[
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt},
@@ -79,8 +104,43 @@ def _call_openai(
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout_seconds,
+                **extra_kwargs,
             )
-            return response.choices[0].message.content or ""
+            call_duration_ms = round((time.perf_counter() - call_start) * 1000, 2)
+
+            text = response.choices[0].message.content or ""
+
+            # ── Extract token usage ───────────────────────────────
+            usage = response.usage
+            prompt_tokens = usage.prompt_tokens if usage else 0
+            completion_tokens = usage.completion_tokens if usage else 0
+            total_tokens = usage.total_tokens if usage else 0
+
+            usage_record: LLMUsageRecord = {
+                "node": node_name,
+                "model": resolved_model,
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+                "estimated_cost_usd": _estimate_cost(
+                    resolved_model, prompt_tokens, completion_tokens,
+                ),
+                "duration_ms": call_duration_ms,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+            logger.info(
+                "OpenAI call completed: model=%s tokens=%d "
+                "(prompt=%d, completion=%d) cost=$%.4f duration=%.0fms",
+                resolved_model,
+                total_tokens,
+                prompt_tokens,
+                completion_tokens,
+                usage_record["estimated_cost_usd"],
+                call_duration_ms,
+            )
+
+            return text, usage_record
 
         except Exception as exc:
             last_exc = exc
@@ -114,6 +174,42 @@ def _call_openai(
     raise last_exc or RuntimeError("OpenAI call failed after retries")
 
 
+# ── Cost estimation lookup ────────────────────────────────────────
+# Prices per 1K tokens (USD). Update as OpenAI publishes new prices.
+_MODEL_PRICING: dict[str, tuple[float, float]] = {
+    # (prompt_per_1k, completion_per_1k)
+    "gpt-4o-mini": (0.03, 0.06)
+}
+
+
+def _estimate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+) -> float:
+    """
+    Estimate the cost of an OpenAI API call in USD.
+
+    Falls back to gpt-4o-mini pricing for unknown models.
+    """
+    # Normalise model name for lookup (strip date suffixes like -0613)
+    model_key = model.lower()
+    for known_model in _MODEL_PRICING:
+        if model_key.startswith(known_model):
+            prompt_rate, completion_rate = _MODEL_PRICING[known_model]
+            return (
+                (prompt_tokens / 1000) * prompt_rate
+                + (completion_tokens / 1000) * completion_rate
+            )
+
+    # Default to gpt-4o-mini pricing if model is unrecognised
+    prompt_rate, completion_rate = _MODEL_PRICING["gpt-4o-mini"]
+    return (
+        (prompt_tokens / 1000) * prompt_rate
+        + (completion_tokens / 1000) * completion_rate
+    )
+
+
 def _extract_json(text: str) -> dict[str, Any]:
     """Extract JSON from a response that may contain markdown code fences."""
     # Try to find JSON in code blocks first
@@ -135,42 +231,6 @@ def _extract_hcl(text: str) -> str:
 # ══════════════════════════════════════════════════════════════════
 #  NODE: plan_attack
 # ══════════════════════════════════════════════════════════════════
-
-PLAN_ATTACK_SYSTEM_PROMPT = """\
-You are a cloud security expert specializing in Azure attack simulation and \
-the MITRE ATT&CK framework (Cloud Matrix). Your task is to take a natural \
-language attack goal and produce a structured attack plan.
-
-You MUST respond with valid JSON (no other text) in this exact format:
-{
-  "goal": "the original goal",
-  "scenario_id": "scenario identifier",
-  "summary": "brief summary of the attack",
-  "mitre_techniques": [
-    {
-      "id": "T1234",
-      "name": "Technique Name",
-      "tactic": "Tactic Name",
-      "description": "How this technique applies to this scenario",
-      "url": "https://attack.mitre.org/techniques/T1234/"
-    }
-  ],
-  "steps": [
-    {
-      "step_number": 1,
-      "description": "What the attacker does",
-      "mitre_technique_id": "T1234",
-      "mitre_technique_name": "Technique Name",
-      "kill_chain_phase": "Phase",
-      "details": "Technical details"
-    }
-  ]
-}
-
-Focus on Azure-specific cloud techniques. Be precise with MITRE ATT&CK IDs.
-Include techniques for: initial access, privilege escalation, defense evasion, \
-and impact as applicable.
-"""
 
 
 def plan_attack(state: OrchestratorState) -> dict[str, Any]:
@@ -203,20 +263,36 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
         )
 
         log.info("Calling OpenAI to generate attack plan for: %s", goal)
-        response = _call_openai(PLAN_ATTACK_SYSTEM_PROMPT, user_prompt)
+        response, usage_record = _call_openai(
+            PLAN_ATTACK_SYSTEM_PROMPT,
+            user_prompt,
+            node_name="plan_attack",
+            json_mode=True,
+        )
+        llm_usage = list(state.get("llm_usage", []))
+        llm_usage.append(usage_record)
 
+        # Validate response against Pydantic schema
         try:
-            attack_plan = _extract_json(response)
-        except (json.JSONDecodeError, ValueError) as exc:
-            log.error("Failed to parse attack plan JSON: %s", exc)
-            attack_plan = {
-                "goal": goal,
-                "scenario_id": scenario_id,
-                "summary": "Failed to generate structured plan. Raw response attached.",
-                "mitre_techniques": [],
-                "steps": [],
-                "_raw_response": response,
-            }
+            parsed = AttackPlanResponse.model_validate_json(response)
+            attack_plan = parsed.model_dump()
+        except (ValidationError, ValueError) as exc:
+            log.warning(
+                "Pydantic validation failed, falling back to raw JSON: %s", exc,
+            )
+            # Fallback: try plain JSON parse (tolerates extra/missing fields)
+            try:
+                attack_plan = _extract_json(response)
+            except (json.JSONDecodeError, ValueError) as parse_exc:
+                log.error("Failed to parse attack plan JSON: %s", parse_exc)
+                attack_plan = {
+                    "goal": goal,
+                    "scenario_id": scenario_id,
+                    "summary": "Failed to generate structured plan. Raw response attached.",
+                    "mitre_techniques": [],
+                    "steps": [],
+                    "_raw_response": response,
+                }
 
         log.info(
             "Attack plan generated: %d techniques, %d steps",
@@ -224,39 +300,12 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
             len(attack_plan.get("steps", [])),
         )
 
-        return {"attack_plan": attack_plan}
+        return {"attack_plan": attack_plan, "llm_usage": llm_usage}
 
 
 # ══════════════════════════════════════════════════════════════════
 #  NODE: generate_infrastructure
 # ══════════════════════════════════════════════════════════════════
-
-FIX_TERRAFORM_SYSTEM_PROMPT = """\
-You are a Terraform expert. The following Terraform code failed with the error \
-below. Fix the code and return ONLY the corrected HCL. Do not explain, just \
-return the fixed code.
-"""
-
-GENERATE_INFRA_SYSTEM_PROMPT = """\
-You are an expert Terraform developer specializing in Azure infrastructure. \
-Your task is to generate complete, valid Terraform HCL code that deploys a \
-*deliberately vulnerable* Azure environment for attack simulation.
-
-Requirements:
-1. Use azurerm provider ~> 3.0
-2. Include proper provider configuration
-3. The infrastructure must contain the specific misconfiguration described
-4. Include necessary networking, compute, and identity resources
-5. Add diagnostic settings / monitoring that the attacker will target
-6. Tag all resources with environment="cortex-simulation"
-7. Output key resource identifiers
-
-Respond with ONLY the Terraform HCL code inside a ```hcl code block. \
-No explanations outside the code block.
-
-IMPORTANT: The code must be syntactically valid and deployable. Include \
-all required fields for each resource.
-"""
 
 
 def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
@@ -283,12 +332,15 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
                 f"## Failed Terraform Code\n```hcl\n{previous_code}\n```\n\n"
                 f"## Error\n```\n{deploy_error}\n```"
             )
-            response = _call_openai(
+            response, usage_record = _call_openai(
                 FIX_TERRAFORM_SYSTEM_PROMPT,
                 fix_user_prompt,
                 max_tokens=8192,
+                node_name="generate_infrastructure",
             )
             terraform_code = _extract_hcl(response)
+            llm_usage = list(state.get("llm_usage", []))
+            llm_usage.append(usage_record)
         else:
             # ── First run: generate from scratch ──────────────────
             # Load the Jinja2 base template as reference
@@ -336,13 +388,16 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             log.info(
                 "Calling OpenAI to generate Terraform (first run)"
             )
-            response = _call_openai(
+            response, usage_record = _call_openai(
                 GENERATE_INFRA_SYSTEM_PROMPT,
                 user_prompt,
                 max_tokens=8192,
+                node_name="generate_infrastructure",
             )
 
             terraform_code = _extract_hcl(response)
+            llm_usage = list(state.get("llm_usage", []))
+            llm_usage.append(usage_record)
 
         # Set up Terraform working directory
         tf_runner = TerraformRunner(
@@ -367,6 +422,7 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             "terraform_code": terraform_code,
             "terraform_working_dir": str(tf_runner.working_dir),
             "terraform_workspace": tf_runner.workspace_name,
+            "llm_usage": llm_usage,
         }
 
 
