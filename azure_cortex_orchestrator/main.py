@@ -69,6 +69,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Custom run ID (default: auto-generated UUID)",
     )
+    parser.add_argument(
+        "--interactive",
+        "-i",
+        action="store_true",
+        default=False,
+        help="Enable human intervention checkpoints (plan review, deploy approval, teardown confirmation)",
+    )
     return parser.parse_args(argv)
 
 
@@ -135,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     log.info("Run ID: %s", run_id)
     log.info("Scenario: %s", args.scenario)
     log.info("Dry Run: %s", args.dry_run)
+    log.info("Interactive: %s", args.interactive)
     log.info("=" * 60)
 
     # ── Check for orphaned runs from previous crashes ─────────────
@@ -179,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         goal=goal,
         scenario_id=args.scenario,
         dry_run=args.dry_run,
+        interactive=args.interactive,
         run_id=run_id,
     )
 

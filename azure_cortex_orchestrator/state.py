@@ -76,6 +76,12 @@ class OrchestratorState(TypedDict, total=False):
     # ── Run metadata ──────────────────────────────────────────────
     run_id: str                     # UUID for this execution run
     dry_run: bool                   # If True, skip cloud operations
+    interactive: bool               # If True, prompt user at checkpoints
+
+    # ── Human intervention ────────────────────────────────────────
+    user_aborted: bool              # Set by checkpoint if user aborts
+    replan_requested: bool          # Set if user wants to modify the goal
+    skip_teardown: bool             # Set if user wants to keep infra alive
 
     # ── Input ─────────────────────────────────────────────────────
     goal: str                       # Natural language attack goal
@@ -120,14 +126,19 @@ def create_initial_state(
     goal: str,
     scenario_id: str,
     dry_run: bool = False,
+    interactive: bool = False,
     run_id: str | None = None,
 ) -> OrchestratorState:
     """Create a fresh initial state for a new orchestration run."""
     return OrchestratorState(
         run_id=run_id or str(uuid.uuid4()),
         dry_run=dry_run,
+        interactive=interactive,
         goal=goal,
         scenario_id=scenario_id,
+        user_aborted=False,
+        replan_requested=False,
+        skip_teardown=False,
         attack_plan={},
         terraform_code="",
         terraform_plan_output="",

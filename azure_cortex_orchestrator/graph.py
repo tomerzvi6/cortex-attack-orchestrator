@@ -5,11 +5,18 @@ Defines the StateGraph with all nodes and conditional edges:
 
     START
       → plan_attack
+      → review_plan (interactive checkpoint #1)
+      → [conditional: aborted / replan / continue]
+         ├─ aborted              → generate_report → END
+         ├─ replan_requested     → plan_attack (loop)
+         └─ continue             → generate_infrastructure
       → generate_infrastructure
       → safety_check
-      → [conditional: dry_run / unsafe / proceed]
+      → approve_deploy (interactive checkpoint #2)
+      → [conditional: dry_run / unsafe / user_rejected / proceed]
          ├─ dry_run=True          → generate_report → END
          ├─ deploy_status=unsafe  → generate_report → END
+         ├─ user_rejected         → generate_report → END
          └─ else                  → deploy_infrastructure
       → [conditional: deploy result]
          ├─ success               → execute_simulator
@@ -17,6 +24,10 @@ Defines the StateGraph with all nodes and conditional edges:
          └─ retries >= 3          → teardown_on_failure → generate_report → END
       → execute_simulator
       → validator
+      → confirm_teardown (interactive checkpoint #3)
+      → [conditional: skip_teardown / proceed]
+         ├─ skip_teardown         → generate_report → END
+         └─ else                  → teardown
       → teardown
       → erasure_validator   ← verifies all cloud resources were fully destroyed
       → generate_report
@@ -26,6 +37,10 @@ NOTE: On every deploy retry, the AI-regenerated Terraform code is
 re-checked by safety_check before it reaches deploy_infrastructure
 again. This ensures that AI self-corrections don't introduce
 safety violations.
+
+NOTE: When --interactive is enabled, three human checkpoints are
+inserted into the flow. In non-interactive mode they pass through
+without blocking.
 """
 
 from __future__ import annotations
@@ -34,6 +49,11 @@ from typing import Any, Literal
 
 from langgraph.graph import END, START, StateGraph
 
+from azure_cortex_orchestrator.human_intervention import (
+    approve_deploy,
+    confirm_teardown,
+    review_plan,
+)
 from azure_cortex_orchestrator.nodes import (
     deploy_infrastructure,
     erasure_validator,
@@ -52,19 +72,41 @@ MAX_DEPLOY_RETRIES = 3
 
 # ── Conditional Edge Functions ────────────────────────────────────
 
-def route_after_safety(
+def route_after_review_plan(
+    state: OrchestratorState,
+) -> Literal["generate_infrastructure", "plan_attack", "generate_report"]:
+    """
+    Route after review_plan checkpoint:
+    - If user aborted → skip to report
+    - If user requested replan → loop back to plan_attack
+    - Otherwise → continue to generate_infrastructure
+    """
+    if state.get("user_aborted", False):
+        return "generate_report"
+
+    if state.get("replan_requested", False):
+        return "plan_attack"
+
+    return "generate_infrastructure"
+
+
+def route_after_approve_deploy(
     state: OrchestratorState,
 ) -> Literal["deploy_infrastructure", "generate_report"]:
     """
-    Route after safety_check:
+    Route after approve_deploy checkpoint:
     - If dry_run → skip to report
     - If unsafe → skip to report (with violations in state)
+    - If user rejected → skip to report
     - Otherwise → proceed to deploy
     """
     if state.get("dry_run", False):
         return "generate_report"
 
-    if state.get("deploy_status") == "unsafe":
+    if state.get("deploy_status") in ("unsafe", "user_rejected"):
+        return "generate_report"
+
+    if state.get("user_aborted", False):
         return "generate_report"
 
     return "deploy_infrastructure"
@@ -92,6 +134,20 @@ def route_after_deploy(
     return "teardown"
 
 
+def route_after_confirm_teardown(
+    state: OrchestratorState,
+) -> Literal["teardown", "generate_report"]:
+    """
+    Route after confirm_teardown checkpoint:
+    - If user chose to keep infra → skip to report (no teardown)
+    - Otherwise → proceed with teardown
+    """
+    if state.get("skip_teardown", False):
+        return "generate_report"
+
+    return "teardown"
+
+
 # ── Graph Builder ─────────────────────────────────────────────────
 
 def build_graph() -> StateGraph:
@@ -105,26 +161,43 @@ def build_graph() -> StateGraph:
 
     # ── Add nodes ─────────────────────────────────────────────────
     graph.add_node("plan_attack", plan_attack)
+    graph.add_node("review_plan", review_plan)
     graph.add_node("generate_infrastructure", generate_infrastructure)
     graph.add_node("safety_check", safety_check)
+    graph.add_node("approve_deploy", approve_deploy)
     graph.add_node("deploy_infrastructure", deploy_infrastructure)
     graph.add_node("execute_simulator", execute_simulator)
     graph.add_node("validator", validator)
+    graph.add_node("confirm_teardown", confirm_teardown)
     graph.add_node("teardown", teardown)
     graph.add_node("erasure_validator", erasure_validator)
     graph.add_node("generate_report", generate_report)
 
     # ── Add edges ─────────────────────────────────────────────────
 
-    # Linear flow: START → plan → generate → safety
+    # START → plan → review_plan checkpoint
     graph.add_edge(START, "plan_attack")
-    graph.add_edge("plan_attack", "generate_infrastructure")
-    graph.add_edge("generate_infrastructure", "safety_check")
+    graph.add_edge("plan_attack", "review_plan")
 
-    # Conditional: after safety → deploy or report (dry-run / unsafe)
+    # Conditional: after review_plan → continue, replan, or abort
     graph.add_conditional_edges(
-        "safety_check",
-        route_after_safety,
+        "review_plan",
+        route_after_review_plan,
+        {
+            "generate_infrastructure": "generate_infrastructure",
+            "plan_attack": "plan_attack",
+            "generate_report": "generate_report",
+        },
+    )
+
+    # generate_infrastructure → safety_check → approve_deploy checkpoint
+    graph.add_edge("generate_infrastructure", "safety_check")
+    graph.add_edge("safety_check", "approve_deploy")
+
+    # Conditional: after approve_deploy → deploy or report
+    graph.add_conditional_edges(
+        "approve_deploy",
+        route_after_approve_deploy,
         {
             "deploy_infrastructure": "deploy_infrastructure",
             "generate_report": "generate_report",
@@ -142,9 +215,21 @@ def build_graph() -> StateGraph:
         },
     )
 
-    # Linear flow: simulator → validator → teardown → erasure_validator → report → END
+    # simulator → validator → confirm_teardown checkpoint
     graph.add_edge("execute_simulator", "validator")
-    graph.add_edge("validator", "teardown")
+    graph.add_edge("validator", "confirm_teardown")
+
+    # Conditional: after confirm_teardown → teardown or skip to report
+    graph.add_conditional_edges(
+        "confirm_teardown",
+        route_after_confirm_teardown,
+        {
+            "teardown": "teardown",
+            "generate_report": "generate_report",
+        },
+    )
+
+    # teardown → erasure_validator → report → END
     graph.add_edge("teardown", "erasure_validator")
     graph.add_edge("erasure_validator", "generate_report")
     graph.add_edge("generate_report", END)
