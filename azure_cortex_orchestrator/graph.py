@@ -60,6 +60,7 @@ from azure_cortex_orchestrator.nodes import (
     execute_simulator,
     generate_infrastructure,
     generate_report,
+    generate_scenario,
     plan_attack,
     safety_check,
     teardown,
@@ -71,6 +72,17 @@ MAX_DEPLOY_RETRIES = 3
 
 
 # ── Conditional Edge Functions ────────────────────────────────────
+def route_after_start(
+    state: OrchestratorState,
+) -> Literal["generate_scenario", "plan_attack"]:
+    """
+    Route at start:
+    - If a free-text prompt is provided → generate_scenario first
+    - Otherwise → go directly to plan_attack (existing behavior)
+    """
+    if state.get("prompt", "").strip():
+        return "generate_scenario"
+    return "plan_attack"
 
 def route_after_review_plan(
     state: OrchestratorState,
@@ -160,6 +172,7 @@ def build_graph() -> StateGraph:
     graph = StateGraph(OrchestratorState)
 
     # ── Add nodes ─────────────────────────────────────────────────
+    graph.add_node("generate_scenario", generate_scenario)
     graph.add_node("plan_attack", plan_attack)
     graph.add_node("review_plan", review_plan)
     graph.add_node("generate_infrastructure", generate_infrastructure)
@@ -175,8 +188,20 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ─────────────────────────────────────────────────
 
-    # START → plan → review_plan checkpoint
-    graph.add_edge(START, "plan_attack")
+    # START → conditional: prompt mode or scenario mode
+    graph.add_conditional_edges(
+        START,
+        route_after_start,
+        {
+            "generate_scenario": "generate_scenario",
+            "plan_attack": "plan_attack",
+        },
+    )
+
+    # generate_scenario → plan_attack
+    graph.add_edge("generate_scenario", "plan_attack")
+
+    # plan_attack → review_plan checkpoint
     graph.add_edge("plan_attack", "review_plan")
 
     # Conditional: after review_plan → continue, replan, or abort

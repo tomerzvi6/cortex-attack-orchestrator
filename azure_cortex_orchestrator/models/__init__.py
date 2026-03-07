@@ -11,7 +11,7 @@ OpenAI API call to guarantee valid JSON without markdown fences.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -59,3 +59,70 @@ class AttackPlanResponse(BaseModel):
         default_factory=list,
         description="Ordered attack execution steps",
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  generate_scenario response schema
+# ═══════════════════════════════════════════════════════════════════
+
+class ScenarioSimulationStep(BaseModel):
+    """A single simulation step in a generated scenario."""
+
+    order: int = Field(..., description="Execution order (1-based)")
+    name: str = Field(..., description="Snake_case step identifier")
+    description: str = Field(..., description="What this step does")
+    sdk_action: str = Field(..., description="SDK action from the supported list")
+    target_resource_type: str = Field(..., description="Cloud resource type being targeted")
+
+
+class ScenarioTerraformHints(BaseModel):
+    """Terraform generation hints for a scenario."""
+
+    resource_types: list[str] = Field(default_factory=list)
+    misconfigurations: list[str] = Field(default_factory=list)
+    role_assignments: list[str] = Field(default_factory=list)
+    region: str = Field(default="eastus")
+
+
+class ScenarioDetectionExpectations(BaseModel):
+    """What the validator should look for."""
+
+    expected_activity_log_operations: list[str] = Field(default_factory=list)
+    expected_alert_types: list[str] = Field(default_factory=list)
+    cortex_xdr_expected_alerts: list[str] = Field(default_factory=list)
+    detection_window_minutes: int = Field(default=10)
+
+
+class ScenarioResponse(BaseModel):
+    """
+    Validated schema for the ``generate_scenario`` LLM response.
+
+    Mirrors the Scenario dataclass so the output can be directly
+    converted to a Scenario and registered dynamically.
+    """
+
+    id: str = Field(..., description="Short snake_case scenario ID")
+    name: str = Field(..., description="Human-readable scenario name")
+    description: str = Field(..., description="2-3 sentence description")
+    goal_template: str = Field(..., description="Natural language goal for the planner")
+    cloud_provider: str = Field(default="azure", description="'azure' or 'aws'")
+    expected_mitre_techniques: list[MITRETechnique] = Field(default_factory=list)
+    terraform_hints: ScenarioTerraformHints = Field(default_factory=ScenarioTerraformHints)
+    simulation_steps: list[ScenarioSimulationStep] = Field(default_factory=list)
+    detection_expectations: ScenarioDetectionExpectations = Field(
+        default_factory=ScenarioDetectionExpectations,
+    )
+
+    @field_validator("cloud_provider")
+    @classmethod
+    def validate_cloud_provider(cls, v: str) -> str:
+        allowed = {"azure", "aws"}
+        if v.lower() not in allowed:
+            raise ValueError(f"cloud_provider must be one of {allowed}, got '{v}'")
+        return v.lower()
+
+    @field_validator("id")
+    @classmethod
+    def validate_id_format(cls, v: str) -> str:
+        """Ensure ID is snake_case-ish (no spaces, lowercase)."""
+        return v.lower().replace(" ", "_").replace("-", "_")

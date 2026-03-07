@@ -19,12 +19,14 @@ from openai import OpenAI
 from pydantic import ValidationError
 
 from azure_cortex_orchestrator.config import Settings, load_settings
-from azure_cortex_orchestrator.models import AttackPlanResponse
+from azure_cortex_orchestrator.models import AttackPlanResponse, ScenarioResponse
 from azure_cortex_orchestrator.prompts import (
     FIX_TERRAFORM_SYSTEM_PROMPT,
     GENERATE_INFRA_SYSTEM_PROMPT,
+    GENERATE_SCENARIO_SYSTEM_PROMPT,
     PLAN_ATTACK_SYSTEM_PROMPT,
 )
+from azure_cortex_orchestrator.prompts.generate_scenario import SUPPORTED_SDK_ACTIONS
 from azure_cortex_orchestrator.scenarios.registry import ScenarioRegistry
 from azure_cortex_orchestrator.state import LLMUsageRecord, OrchestratorState
 from azure_cortex_orchestrator.utils.observability import get_logger, node_logger
@@ -229,6 +231,122 @@ def _extract_hcl(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  NODE: generate_scenario
+# ══════════════════════════════════════════════════════════════════
+
+
+def generate_scenario(state: OrchestratorState) -> dict[str, Any]:
+    """
+    Node: Convert a free-text user prompt into a structured Scenario
+    and register it dynamically. Only runs when state['prompt'] is set.
+
+    This node:
+    1. Sends the prompt to the LLM with GENERATE_SCENARIO_SYSTEM_PROMPT
+    2. Validates the response with ScenarioResponse (Pydantic)
+    3. Validates sdk_actions against the supported allowlist
+    4. Creates a Scenario dataclass and registers it in ScenarioRegistry
+    5. Sets state['goal'] and state['scenario_id'] for downstream nodes
+    """
+    with node_logger("generate_scenario", state.get("run_id", "")) as log:
+        prompt = state.get("prompt", "")
+        if not prompt:
+            log.debug("No prompt provided — skipping scenario generation")
+            return {}
+
+        log.info("Generating scenario from user prompt: %s", prompt[:200])
+
+        response, usage_record = _call_openai(
+            GENERATE_SCENARIO_SYSTEM_PROMPT,
+            f"User request: {prompt}",
+            node_name="generate_scenario",
+            json_mode=True,
+            max_tokens=4096,
+        )
+        llm_usage = list(state.get("llm_usage", []))
+        llm_usage.append(usage_record)
+
+        # ── Parse and validate with Pydantic ──────────────────────
+        try:
+            parsed = ScenarioResponse.model_validate_json(response)
+        except Exception as exc:
+            log.warning("Pydantic validation failed, trying raw JSON: %s", exc)
+            try:
+                raw = _extract_json(response)
+                parsed = ScenarioResponse.model_validate(raw)
+            except Exception as parse_exc:
+                log.error("Failed to parse scenario response: %s", parse_exc)
+                # Return with original state — will fall through to
+                # plan_attack with whatever goal/scenario_id was set
+                return {"llm_usage": llm_usage}
+
+        # ── Validate sdk_actions against allowlist ────────────────
+        cloud = parsed.cloud_provider
+        supported = set(SUPPORTED_SDK_ACTIONS.get(cloud, []))
+        for step in parsed.simulation_steps:
+            if step.sdk_action not in supported:
+                log.warning(
+                    "LLM generated unsupported sdk_action '%s' for %s — "
+                    "replacing with closest match or removing",
+                    step.sdk_action, cloud,
+                )
+                # Try fuzzy match: same service prefix
+                service_prefix = step.sdk_action.split(".")[0]
+                candidates = [a for a in supported if a.startswith(service_prefix)]
+                if candidates:
+                    step.sdk_action = candidates[0]
+                    log.info("  → Replaced with: %s", step.sdk_action)
+                else:
+                    step.sdk_action = f"UNSUPPORTED:{step.sdk_action}"
+
+        # ── Build Scenario dataclass and register ─────────────────
+        from azure_cortex_orchestrator.scenarios.registry import (
+            Scenario,
+            SimulationStep,
+        )
+
+        scenario = Scenario(
+            id=parsed.id,
+            name=parsed.name,
+            description=parsed.description,
+            goal_template=parsed.goal_template,
+            cloud_provider=parsed.cloud_provider,
+            expected_mitre_techniques=[
+                t.model_dump() for t in parsed.expected_mitre_techniques
+            ],
+            terraform_hints=parsed.terraform_hints.model_dump(),
+            simulation_steps=[
+                SimulationStep(
+                    order=s.order,
+                    name=s.name,
+                    description=s.description,
+                    sdk_action=s.sdk_action,
+                    target_resource_type=s.target_resource_type,
+                )
+                for s in parsed.simulation_steps
+            ],
+            detection_expectations=parsed.detection_expectations.model_dump(),
+        )
+
+        registry = ScenarioRegistry.get_instance()
+        registry.register(scenario)
+
+        log.info(
+            "Scenario generated and registered: id=%s, cloud=%s, "
+            "%d techniques, %d steps",
+            scenario.id,
+            scenario.cloud_provider,
+            len(scenario.expected_mitre_techniques),
+            len(scenario.simulation_steps),
+        )
+
+        return {
+            "goal": parsed.goal_template,
+            "scenario_id": parsed.id,
+            "llm_usage": llm_usage,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════
 #  NODE: plan_attack
 # ══════════════════════════════════════════════════════════════════
 
@@ -343,20 +461,42 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             llm_usage.append(usage_record)
         else:
             # ── First run: generate from scratch ──────────────────
-            # Load the Jinja2 base template as reference
+            # Load the Jinja2 base template based on cloud provider
             templates_dir = Path(__file__).resolve().parent / "templates"
             jinja_env = Environment(loader=FileSystemLoader(str(templates_dir)))
 
+            # Determine cloud provider for template selection
+            cloud_provider = "azure"
+            try:
+                registry = ScenarioRegistry.get_instance()
+                scenario = registry.get(scenario_id)
+                cloud_provider = scenario.cloud_provider or "azure"
+            except KeyError:
+                pass
+
             template_context = ""
             try:
-                template = jinja_env.get_template("base_infra.tf.j2")
-                rendered = template.render(
-                    resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
-                    subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
-                    run_id=run_id,
-                    location="eastus",
-                    vm_name=f"sim-vm-{run_id[:8]}",
+                template_name = (
+                    "base_infra_aws.tf.j2"
+                    if cloud_provider == "aws"
+                    else "base_infra.tf.j2"
                 )
+                template = jinja_env.get_template(template_name)
+
+                if cloud_provider == "aws":
+                    rendered = template.render(
+                        resource_name_prefix="cortex-sim-",
+                        run_id=run_id,
+                        region="us-east-1",
+                    )
+                else:
+                    rendered = template.render(
+                        resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
+                        subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
+                        run_id=run_id,
+                        location="eastus",
+                        vm_name=f"sim-vm-{run_id[:8]}",
+                    )
                 template_context = f"\n\nHere's a reference template to guide your output:\n```hcl\n{rendered}\n```"
             except Exception as exc:
                 log.warning("Failed to render Jinja2 template: %s", exc)
@@ -467,44 +607,101 @@ def safety_check(state: OrchestratorState) -> dict[str, Any]:
 
         # ── Layer 1: Regex-based HCL source analysis ──────────────
 
-        # Check 1: Resource group prefix
-        rg_pattern = re.findall(
-            r'resource\s+"azurerm_resource_group".*?name\s*=\s*"([^"]+)"',
-            terraform_code,
-            re.DOTALL,
-        )
-        for rg_name in rg_pattern:
-            if not rg_name.startswith(settings.resource_group_prefix):
-                violations.append(
-                    f"Resource group '{rg_name}' does not start with "
-                    f"required prefix '{settings.resource_group_prefix}'"
-                )
+        # Determine cloud provider for this run
+        cloud_provider = "azure"
+        try:
+            registry = ScenarioRegistry.get_instance()
+            scenario = registry.get(state.get("scenario_id", ""))
+            cloud_provider = scenario.cloud_provider or "azure"
+        except KeyError:
+            pass
 
-        # Check 2: Subscription allowlist
-        if settings.allowed_subscriptions:
-            sub_refs = re.findall(
-                r'/subscriptions/([a-f0-9-]+)',
+        if cloud_provider == "azure":
+            # Check 1: Resource group prefix
+            rg_pattern = re.findall(
+                r'resource\s+"azurerm_resource_group".*?name\s*=\s*"([^"]+)"',
                 terraform_code,
-                re.IGNORECASE,
+                re.DOTALL,
             )
-            for sub_id in sub_refs:
-                if sub_id not in settings.allowed_subscriptions:
+            for rg_name in rg_pattern:
+                if not rg_name.startswith(settings.resource_group_prefix):
                     violations.append(
-                        f"Subscription '{sub_id}' is not in the allowed list"
+                        f"Resource group '{rg_name}' does not start with "
+                        f"required prefix '{settings.resource_group_prefix}'"
                     )
 
-        # Check 3: No AAD / tenant-level operations
-        dangerous_resources = [
-            "azuread_", "azurerm_management_group",
-            "azurerm_tenant", "azurerm_policy_definition",
-        ]
-        for dangerous in dangerous_resources:
-            if dangerous in terraform_code.lower():
+            # Check 2: Subscription allowlist
+            if settings.allowed_subscriptions:
+                sub_refs = re.findall(
+                    r'/subscriptions/([a-f0-9-]+)',
+                    terraform_code,
+                    re.IGNORECASE,
+                )
+                for sub_id in sub_refs:
+                    if sub_id not in settings.allowed_subscriptions:
+                        violations.append(
+                            f"Subscription '{sub_id}' is not in the allowed list"
+                        )
+
+            # Check 3: No AAD / tenant-level operations
+            dangerous_resources = [
+                "azuread_", "azurerm_management_group",
+                "azurerm_tenant", "azurerm_policy_definition",
+            ]
+            for dangerous in dangerous_resources:
+                if dangerous in terraform_code.lower():
+                    violations.append(
+                        f"Potentially dangerous resource type detected: '{dangerous}'"
+                    )
+
+        elif cloud_provider == "aws":
+            # AWS-specific safety checks
+
+            # Check 1: No IAM admin / organization-level resources
+            dangerous_aws_resources = [
+                "aws_organizations_",
+                "aws_iam_account_alias",
+                "aws_iam_account_password_policy",
+            ]
+            for dangerous in dangerous_aws_resources:
+                if dangerous in terraform_code.lower():
+                    violations.append(
+                        f"Potentially dangerous AWS resource type: '{dangerous}'"
+                    )
+
+            # Check 2: Block wildcard IAM policies (Action: "*")
+            if re.search(
+                r'"Action"\s*:\s*"\*"',
+                terraform_code,
+            ):
                 violations.append(
-                    f"Potentially dangerous resource type detected: '{dangerous}'"
+                    'IAM policy with Action: "*" (admin access) detected'
                 )
 
-        # Check 4: Resource count
+            # Check 3: Block excessive public S3 ACLs
+            public_acl_count = len(re.findall(
+                r'acl\s*=\s*"public-read',
+                terraform_code,
+            ))
+            if public_acl_count > 1:
+                violations.append(
+                    f"Multiple public S3 ACLs detected ({public_acl_count}) — "
+                    f"only 1 expected for simulation"
+                )
+
+            # Check 4: Resource naming prefix
+            bucket_names = re.findall(
+                r'resource\s+"aws_s3_bucket".*?bucket\s*=\s*"([^"]+)"',
+                terraform_code,
+                re.DOTALL,
+            )
+            for name in bucket_names:
+                if not name.startswith("cortex-sim"):
+                    violations.append(
+                        f"S3 bucket '{name}' does not start with 'cortex-sim' prefix"
+                    )
+
+        # Check (universal): Resource count
         resource_count = len(re.findall(
             r'^resource\s+"',
             terraform_code,

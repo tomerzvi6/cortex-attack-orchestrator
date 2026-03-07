@@ -8,6 +8,7 @@ Usage:
     python -m azure_cortex_orchestrator.main --dry-run --scenario vm_identity_log_deletion
     python -m azure_cortex_orchestrator.main --list-scenarios
     python -m azure_cortex_orchestrator.main --goal "Custom attack goal..." --scenario vm_identity_log_deletion
+    python -m azure_cortex_orchestrator.main --prompt "Test if Cortex detects S3 data exfiltration" --dry-run
 """
 
 from __future__ import annotations
@@ -35,14 +36,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--scenario",
         type=str,
-        default="vm_identity_log_deletion",
-        help="Scenario ID from the registry (default: vm_identity_log_deletion)",
+        default=None,
+        help="Scenario ID from the registry (default: vm_identity_log_deletion). "
+             "Optional when --prompt is provided.",
     )
     parser.add_argument(
         "--goal",
         type=str,
         default=None,
         help="Custom attack goal (overrides scenario default)",
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help=(
+            "Free-text attack description. The AI will generate a full "
+            "scenario definition from this prompt. When used, --scenario "
+            "is optional."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -109,6 +121,10 @@ def main(argv: list[str] | None = None) -> int:
         list_scenarios()
         return 0
 
+    # ── Validate that we have either --prompt or --scenario ─────
+    if not args.prompt and not args.scenario:
+        args.scenario = "vm_identity_log_deletion"  # backward-compatible default
+
     # ── Load configuration ────────────────────────────────────────
     try:
         settings = load_settings()
@@ -140,7 +156,10 @@ def main(argv: list[str] | None = None) -> int:
     log.info("=" * 60)
     log.info("Azure-Cortex Orchestrator starting")
     log.info("Run ID: %s", run_id)
-    log.info("Scenario: %s", args.scenario)
+    log.info("Mode: %s", "prompt" if args.prompt else "scenario")
+    if args.prompt:
+        log.info("Prompt: %s", args.prompt[:200])
+    log.info("Scenario: %s", args.scenario or "(will be generated)")
     log.info("Dry Run: %s", args.dry_run)
     log.info("Interactive: %s", args.interactive)
     log.info("=" * 60)
@@ -169,26 +188,34 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # ── Resolve scenario ──────────────────────────────────────────
-    registry = ScenarioRegistry.get_instance()
-    try:
-        scenario = registry.get(args.scenario)
-    except KeyError as exc:
-        log.error("Scenario not found: %s", exc)
-        print(f"ERROR: {exc}", file=sys.stderr)
-        print("Use --list-scenarios to see available scenarios.", file=sys.stderr)
-        return 1
+    # ── Resolve goal ───────────────────────────────────────────────
+    if args.prompt:
+        # Prompt mode: goal will be set by generate_scenario node
+        goal = args.goal or args.prompt
+        scenario_id = args.scenario or "custom"
+    else:
+        # Scenario mode: existing behavior
+        registry = ScenarioRegistry.get_instance()
+        try:
+            scenario = registry.get(args.scenario)
+        except KeyError as exc:
+            log.error("Scenario not found: %s", exc)
+            print(f"ERROR: {exc}", file=sys.stderr)
+            print("Use --list-scenarios to see available scenarios.", file=sys.stderr)
+            return 1
+        goal = args.goal or scenario.goal_template
+        scenario_id = args.scenario
 
-    goal = args.goal or scenario.goal_template
     log.info("Attack goal: %s", goal)
 
     # ── Build initial state ───────────────────────────────────────
     initial_state = create_initial_state(
         goal=goal,
-        scenario_id=args.scenario,
+        scenario_id=scenario_id,
         dry_run=args.dry_run,
         interactive=args.interactive,
         run_id=run_id,
+        prompt=args.prompt or "",
     )
 
     # ── Compile and run graph ─────────────────────────────────────
@@ -212,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     print("EXECUTION COMPLETE")
     print("=" * 60)
     print(f"  Run ID:        {run_id}")
-    print(f"  Scenario:      {args.scenario}")
+    print(f"  Scenario:      {final_state.get('scenario_id', scenario_id)}")
     print(f"  Dry Run:       {args.dry_run}")
     print(f"  Deploy Status: {deploy_status}")
 

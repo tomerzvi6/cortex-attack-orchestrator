@@ -10,7 +10,12 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 │                                                               │
 │  START                                                        │
 │    │                                                          │
-│    ▼                                                          │
+│    ├── [--prompt provided] ──▶ ┌───────────────────┐          │
+│    │                           │ generate_scenario  │          │
+│    │                           │ (OpenAI → Scenario)│          │
+│    │                           └────────┬──────────┘          │
+│    │                                    │                     │
+│    ▼◀───────────────────────────────────┘                     │
 │  ┌──────────────┐     ┌─────────────────────────┐             │
 │  │ plan_attack   │────▶│ generate_infrastructure │◀─┐         │
 │  │ (OpenAI+ATT&CK)│    │ (OpenAI+Terraform)      │  │ retry  │
@@ -67,10 +72,11 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 
 ## Features
 
+- **Free-Text Prompt Mode** — Describe an attack scenario in natural language; the AI generates a full scenario (cloud provider, MITRE techniques, simulation steps, Terraform hints) on the fly
 - **MITRE ATT&CK Mapping** — AI-powered attack planning with technique IDs
 - **Multi-Cloud** — Azure and AWS scenarios with pluggable cloud provider layer
 - **Terraform IaC** — Auto-generated vulnerable cloud infrastructure
-- **Two-Layer Safety Guardrails** — Regex on HCL source + `terraform plan -json` resolved-value analysis (resource group prefix, subscription allowlist, dangerous-resource blocklist, resource count cap)
+- **Two-Layer Safety Guardrails** — Regex on HCL source + `terraform plan -json` resolved-value analysis; cloud-aware checks for both Azure (resource group prefix, subscription allowlist, AAD blocklist) and AWS (organizations blocklist, wildcard IAM policy, public S3 ACL, bucket naming)
 - **Pluggable Validators** — Cortex XDR API (polling with exponential backoff) or simulated rule-based detection
 - **Scenario Registry** — Extensible plugin framework; add new attack scenarios by dropping a Python file
 - **Dry-Run Mode** — Test the full flow without deploying cloud resources
@@ -143,7 +149,16 @@ A live run will:
 8. Verify erasure (cloud API check for orphaned resources)
 9. Generate a Markdown + JSON report
 
-### 7. Custom goal
+### 7. Free-text prompt (AI-generated scenario)
+
+```bash
+python -m azure_cortex_orchestrator.main --dry-run \
+  --prompt "Test if Cortex detects an attacker using a compromised IAM user to disable CloudTrail logging and exfiltrate data from S3 buckets"
+```
+
+The AI will generate a complete scenario (cloud provider, MITRE techniques, simulation steps, Terraform hints) from your description, register it dynamically, and then run the full pipeline.
+
+### 8. Custom goal (pre-defined scenario)
 
 ```bash
 python -m azure_cortex_orchestrator.main \
@@ -162,7 +177,7 @@ streamlit run dashboard/app.py
 
 The dashboard provides:
 
-- **Dashboard tab** — Run simulations with live status updates, view MITRE ATT&CK mappings, simulation timelines, detection verdicts, and generated Terraform code.
+- **Dashboard tab** — Run simulations with live status updates, view MITRE ATT&CK mappings, simulation timelines, detection verdicts, and generated Terraform code. Supports both **Scenario Library** and **Free-Text Prompt** input modes.
 - **Reports tab** — Browse and review past simulation reports (Markdown + JSON download).
 - **Scenario Library tab** — Explore all registered attack scenarios with MITRE technique badges, simulation step counts, and Terraform resource types.
 
@@ -203,6 +218,10 @@ azure_cortex_orchestrator/
 │   ├── base.py              # Abstract CloudProvider interface
 │   ├── azure_provider.py    # Azure SDK implementation
 │   └── aws_provider.py      # AWS boto3 implementation
+├── prompts/
+│   ├── plan_attack.py       # System prompt for attack planning
+│   ├── generate_infrastructure.py  # System prompt for Terraform generation
+│   └── generate_scenario.py # System prompt + SDK allowlist for free-text mode
 ├── scenarios/
 │   ├── registry.py          # Scenario registry with auto-discovery
 │   ├── vm_identity_log_deletion.py     # Azure: delete activity logs
@@ -224,7 +243,8 @@ azure_cortex_orchestrator/
 │   ├── run_manifest.py      # Crash-recovery run manifest persistence
 │   └── reporting.py         # Report generation
 ├── templates/
-│   └── base_infra.tf.j2     # Jinja2 Terraform template
+│   ├── base_infra.tf.j2     # Jinja2 Terraform template (Azure)
+│   └── base_infra_aws.tf.j2 # Jinja2 Terraform template (AWS)
 └── reports/                 # Generated reports (per run_id)
 ```
 
@@ -288,9 +308,18 @@ Each run generates reports in `azure_cortex_orchestrator/reports/{run_id}/`:
 The `safety_check` node enforces guardrails through a **two-layer** approach before any infrastructure is deployed:
 
 **Layer 1 — Static HCL analysis (regex):**
+
+*Azure checks:*
 - Resource groups must use the configured prefix (`cortex-sim-` by default)
 - Subscription IDs must be in the allowlist (if configured)
 - No AAD / tenant-level resource modifications
+- Resource count cannot exceed the configured maximum
+
+*AWS checks:*
+- No `aws_organizations_` resources
+- No wildcard (`"*"`) IAM policy actions
+- Public S3 ACLs limited to 1 bucket
+- S3 bucket names must start with `cortex-sim-`
 - Resource count cannot exceed the configured maximum
 
 **Layer 2 — Plan-JSON analysis (resolved values):**

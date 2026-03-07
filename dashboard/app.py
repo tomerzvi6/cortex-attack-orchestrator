@@ -119,27 +119,49 @@ def _list_past_runs() -> list[dict[str, str]]:
 
 st.sidebar.header("🛡️ Cortex Attack Orchestrator")
 
+# ── Mode selection ─────────────────────────────────────────────
+mode = st.sidebar.radio(
+    "Input Mode",
+    options=["Scenario Library", "Free-Text Prompt"],
+    index=0,
+    help="Choose between a pre-defined scenario or describe your own attack.",
+)
+
 registry = _get_registry()
 scenarios = registry.list_all()
 scenario_map = {s.id: s for s in scenarios}
 scenario_ids = [s.id for s in scenarios]
 
-selected_scenario_id = st.sidebar.selectbox(
-    "Scenario",
-    options=scenario_ids,
-    index=0 if scenario_ids else None,
-    help="Choose an attack scenario from the registry.",
-)
+# Mode-specific inputs
+selected_scenario_id = None
+selected_scenario = None
+custom_goal = ""
+free_prompt = ""
 
-selected_scenario = scenario_map.get(selected_scenario_id)  # type: ignore[arg-type]
-
-default_goal = selected_scenario.goal_template if selected_scenario else ""
-custom_goal = st.sidebar.text_area(
-    "Custom Goal (optional)",
-    value=default_goal,
-    height=100,
-    help="Override the scenario's default attack goal.",
-)
+if mode == "Scenario Library":
+    selected_scenario_id = st.sidebar.selectbox(
+        "Scenario",
+        options=scenario_ids,
+        index=0 if scenario_ids else None,
+        help="Choose an attack scenario from the registry.",
+    )
+    selected_scenario = scenario_map.get(selected_scenario_id)  # type: ignore[arg-type]
+    default_goal = selected_scenario.goal_template if selected_scenario else ""
+    custom_goal = st.sidebar.text_area(
+        "Custom Goal (optional)",
+        value=default_goal,
+        height=100,
+        help="Override the scenario's default attack goal.",
+    )
+else:
+    free_prompt = st.sidebar.text_area(
+        "Describe Your Attack",
+        value="",
+        height=150,
+        placeholder="e.g., Test if Cortex detects an attacker exfiltrating data from an Azure SQL database via a compromised managed identity",
+        help="Describe what you want to simulate in plain English. "
+             "The AI will generate the full scenario automatically.",
+    )
 
 dry_run = st.sidebar.checkbox("Dry Run Mode", value=True)
 
@@ -156,18 +178,29 @@ tab_dashboard, tab_reports, tab_library = st.tabs(
 # ══════════════════════════════════════════════════════════════════
 
 with tab_dashboard:
-    if run_clicked and selected_scenario_id:
+    if run_clicked and (selected_scenario_id or free_prompt):
         # --- Run the simulation with live status updates -----------
         with st.status("Running simulation…", expanded=True) as status:
             st.write("⏳ Compiling LangGraph orchestration graph…")
             compiled = compile_graph()
 
-            goal = custom_goal or default_goal
-            initial_state = create_initial_state(
-                goal=goal,
-                scenario_id=selected_scenario_id,
-                dry_run=dry_run,
-            )
+            if free_prompt:
+                # Prompt mode
+                st.write("🤖 **Prompt mode** — AI will generate a scenario first")
+                initial_state = create_initial_state(
+                    goal=free_prompt,
+                    scenario_id="custom",
+                    dry_run=dry_run,
+                    prompt=free_prompt,
+                )
+            else:
+                # Scenario mode (existing)
+                goal = custom_goal or (selected_scenario.goal_template if selected_scenario else "")
+                initial_state = create_initial_state(
+                    goal=goal,
+                    scenario_id=selected_scenario_id,
+                    dry_run=dry_run,
+                )
 
             st.write("📝 Starting graph execution…")
 

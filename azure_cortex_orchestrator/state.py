@@ -84,6 +84,7 @@ class OrchestratorState(TypedDict, total=False):
     skip_teardown: bool             # Set if user wants to keep infra alive
 
     # ── Input ─────────────────────────────────────────────────────
+    prompt: str                     # Free-text user prompt (optional, triggers generate_scenario)
     goal: str                       # Natural language attack goal
     scenario_id: str                # Scenario registry key
 
@@ -128,12 +129,14 @@ def create_initial_state(
     dry_run: bool = False,
     interactive: bool = False,
     run_id: str | None = None,
+    prompt: str = "",
 ) -> OrchestratorState:
     """Create a fresh initial state for a new orchestration run."""
     return OrchestratorState(
         run_id=run_id or str(uuid.uuid4()),
         dry_run=dry_run,
         interactive=interactive,
+        prompt=prompt,
         goal=goal,
         scenario_id=scenario_id,
         user_aborted=False,
