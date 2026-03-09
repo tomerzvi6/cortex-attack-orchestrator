@@ -101,7 +101,7 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 ### 1. Clone and install
 
 ```bash
-cd palo_alto_interview
+git clone https://github.com/tomerzvi6/cortex-attack-orchestrator.git
 pip install -r requirements.txt
 ```
 
