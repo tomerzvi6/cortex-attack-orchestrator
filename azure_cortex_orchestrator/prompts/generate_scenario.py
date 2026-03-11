@@ -117,3 +117,19 @@ CRITICAL RULES:
 6. Include 3-6 simulation steps in logical order.
 7. Be precise with MITRE ATT&CK IDs — use the Cloud Matrix.
 """
+
+
+def build_generate_scenario_prompt(cobra_intel: dict | None = None) -> str:
+    """
+    Return the system prompt for generate_scenario, optionally enriched
+    with cobra-tool attack modules as supplementary reference material.
+
+    Cobra-tool content is appended as additional inspiration — the LLM
+    remains free to define any scenario structure it considers best.
+    """
+    if not cobra_intel or not cobra_intel.get("files"):
+        return GENERATE_SCENARIO_SYSTEM_PROMPT
+
+    from azure_cortex_orchestrator.utils.cobra_tool import format_for_prompt
+    appendix = format_for_prompt(cobra_intel)
+    return GENERATE_SCENARIO_SYSTEM_PROMPT + appendix if appendix else GENERATE_SCENARIO_SYSTEM_PROMPT

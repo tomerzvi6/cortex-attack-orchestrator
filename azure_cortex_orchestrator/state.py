@@ -11,6 +11,24 @@ import uuid
 from typing import Any, TypedDict
 
 
+class CobraFile(TypedDict, total=False):
+    """A single file fetched from the cobra-tool repo."""
+
+    path: str    # repo-relative path, e.g. "attacks/lateral_movement.yaml"
+    name: str    # filename only
+    content: str # raw text content
+
+
+class CobraIntel(TypedDict, total=False):
+    """Live attack intelligence fetched from PaloAltoNetworks/cobra-tool."""
+
+    fetched_at: str           # ISO-8601 timestamp of last successful fetch
+    commit_sha: str           # Latest commit SHA (used for change detection)
+    repo_url: str             # Source repo URL
+    files: list[CobraFile]    # Fetched attack definition files
+    summary: str              # Human-readable fetch summary (for logs)
+
+
 class AttackStep(TypedDict, total=False):
     """A single step in the attack plan."""
 
@@ -117,7 +135,8 @@ class OrchestratorState(TypedDict, total=False):
 
     # ── LLM Observability ──────────────────────────────────────────
     llm_usage: list[LLMUsageRecord]  # Token/cost metrics per LLM call
-
+    # ── External Intel ─────────────────────────────────────────
+    cobra_intel: CobraIntel         # Live intel from the cobra-tool repo (optional)
     # ── Reporting ─────────────────────────────────────────────────
     report_path: str                # Path to the generated report directory
     report: str                     # Full Markdown report content

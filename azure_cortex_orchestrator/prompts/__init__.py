@@ -8,18 +8,24 @@ Separating prompts from node logic enables:
 - Easy A/B testing or model-specific tuning
 """
 
-from azure_cortex_orchestrator.prompts.plan_attack import PLAN_ATTACK_SYSTEM_PROMPT
+from azure_cortex_orchestrator.prompts.plan_attack import (
+    PLAN_ATTACK_SYSTEM_PROMPT,
+    build_plan_attack_prompt,
+)
 from azure_cortex_orchestrator.prompts.generate_infrastructure import (
     FIX_TERRAFORM_SYSTEM_PROMPT,
     GENERATE_INFRA_SYSTEM_PROMPT,
 )
 from azure_cortex_orchestrator.prompts.generate_scenario import (
     GENERATE_SCENARIO_SYSTEM_PROMPT,
+    build_generate_scenario_prompt,
 )
 
 __all__ = [
     "PLAN_ATTACK_SYSTEM_PROMPT",
+    "build_plan_attack_prompt",
     "FIX_TERRAFORM_SYSTEM_PROMPT",
     "GENERATE_INFRA_SYSTEM_PROMPT",
     "GENERATE_SCENARIO_SYSTEM_PROMPT",
+    "build_generate_scenario_prompt",
 ]

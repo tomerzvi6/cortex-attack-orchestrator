@@ -25,6 +25,8 @@ from azure_cortex_orchestrator.prompts import (
     GENERATE_INFRA_SYSTEM_PROMPT,
     GENERATE_SCENARIO_SYSTEM_PROMPT,
     PLAN_ATTACK_SYSTEM_PROMPT,
+    build_generate_scenario_prompt,
+    build_plan_attack_prompt,
 )
 from azure_cortex_orchestrator.prompts.generate_scenario import SUPPORTED_SDK_ACTIONS
 from azure_cortex_orchestrator.scenarios.registry import ScenarioRegistry
@@ -231,6 +233,63 @@ def _extract_hcl(text: str) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════
+#  NODE: fetch_cobra_intel
+# ══════════════════════════════════════════════════════════════════
+
+
+def fetch_cobra_intel(state: OrchestratorState) -> dict[str, Any]:
+    """
+    Node: Fetch live attack intelligence from PaloAltoNetworks/cobra-tool.
+
+    Runs at the very start of every graph execution before planning or
+    scenario generation.  Checks GitHub for the latest commit SHA; if the
+    repo has changed since the last run, downloads updated attack definition
+    files and stores them in state['cobra_intel'].
+
+    Downstream nodes (plan_attack, generate_scenario) automatically include
+    the cobra-tool content as supplementary reference in their LLM prompts.
+
+    Graceful degradation: any error (network, rate-limit, auth) is caught
+    and logged.  The run continues normally with no cobra intel rather than
+    failing.  The integration can also be turned off entirely via
+    COBRA_TOOL_ENABLED=false.
+    """
+    with node_logger("fetch_cobra_intel", state.get("run_id", "")) as log:
+        settings = _get_settings()
+
+        if not settings.cobra_tool_enabled:
+            log.info(
+                "cobra-tool integration disabled (COBRA_TOOL_ENABLED=false)"
+            )
+            return {}
+
+        try:
+            from azure_cortex_orchestrator.utils.cobra_tool import (
+                fetch as cobra_fetch,
+            )
+
+            intel = cobra_fetch(
+                github_token=settings.cobra_tool_github_token or None,
+                cache_ttl=settings.cobra_tool_cache_ttl,
+            )
+            if intel:
+                log.info("cobra-tool intel ready: %s", intel["summary"])
+                return {"cobra_intel": intel}
+            else:
+                log.warning(
+                    "cobra-tool: no intel available (fetch returned None)"
+                )
+                return {}
+
+        except Exception as exc:
+            log.warning(
+                "cobra-tool: failed to fetch intel (%s) — continuing without it",
+                exc,
+            )
+            return {}
+
+
+# ══════════════════════════════════════════════════════════════════
 #  NODE: generate_scenario
 # ══════════════════════════════════════════════════════════════════
 
@@ -256,7 +315,7 @@ def generate_scenario(state: OrchestratorState) -> dict[str, Any]:
         log.info("Generating scenario from user prompt: %s", prompt[:200])
 
         response, usage_record = _call_openai(
-            GENERATE_SCENARIO_SYSTEM_PROMPT,
+            build_generate_scenario_prompt(state.get("cobra_intel")),
             f"User request: {prompt}",
             node_name="generate_scenario",
             json_mode=True,
@@ -382,7 +441,7 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
 
         log.info("Calling OpenAI to generate attack plan for: %s", goal)
         response, usage_record = _call_openai(
-            PLAN_ATTACK_SYSTEM_PROMPT,
+            build_plan_attack_prompt(state.get("cobra_intel")),
             user_prompt,
             node_name="plan_attack",
             json_mode=True,

@@ -40,3 +40,20 @@ Focus on Azure-specific cloud techniques. Be precise with MITRE ATT&CK IDs.
 Include techniques for: initial access, privilege escalation, defense evasion, \
 and impact as applicable.
 """
+
+
+def build_plan_attack_prompt(cobra_intel: dict | None = None) -> str:
+    """
+    Return the system prompt for plan_attack, optionally enriched with
+    cobra-tool attack intelligence as supplementary reference material.
+
+    When cobra intel is available its content is appended as a clearly
+    labelled section so the LLM can draw inspiration from real attack
+    implementations without being constrained to them.
+    """
+    if not cobra_intel or not cobra_intel.get("files"):
+        return PLAN_ATTACK_SYSTEM_PROMPT
+
+    from azure_cortex_orchestrator.utils.cobra_tool import format_for_prompt
+    appendix = format_for_prompt(cobra_intel)
+    return PLAN_ATTACK_SYSTEM_PROMPT + appendix if appendix else PLAN_ATTACK_SYSTEM_PROMPT

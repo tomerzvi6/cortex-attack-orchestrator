@@ -4,7 +4,10 @@ LangGraph graph construction for the Azure-Cortex Orchestrator.
 Defines the StateGraph with all nodes and conditional edges:
 
     START
-      → plan_attack
+      → fetch_cobra_intel  ← live cobra-tool repo intel (graceful no-op if offline)
+      → [conditional: prompt mode or scenario mode]
+         ├─ prompt provided   → generate_scenario
+         └─ scenario mode     → plan_attack
       → review_plan (interactive checkpoint #1)
       → [conditional: aborted / replan / continue]
          ├─ aborted              → generate_report → END
@@ -58,6 +61,7 @@ from azure_cortex_orchestrator.nodes import (
     deploy_infrastructure,
     erasure_validator,
     execute_simulator,
+    fetch_cobra_intel,
     generate_infrastructure,
     generate_report,
     generate_scenario,
@@ -172,6 +176,7 @@ def build_graph() -> StateGraph:
     graph = StateGraph(OrchestratorState)
 
     # ── Add nodes ─────────────────────────────────────────────────
+    graph.add_node("fetch_cobra_intel", fetch_cobra_intel)
     graph.add_node("generate_scenario", generate_scenario)
     graph.add_node("plan_attack", plan_attack)
     graph.add_node("review_plan", review_plan)
@@ -188,9 +193,12 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ─────────────────────────────────────────────────
 
-    # START → conditional: prompt mode or scenario mode
+    # START → fetch_cobra_intel (always first — pulls live intel before planning)
+    graph.add_edge(START, "fetch_cobra_intel")
+
+    # fetch_cobra_intel → conditional: prompt mode or scenario mode
     graph.add_conditional_edges(
-        START,
+        "fetch_cobra_intel",
         route_after_start,
         {
             "generate_scenario": "generate_scenario",

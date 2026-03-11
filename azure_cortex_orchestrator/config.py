@@ -44,7 +44,10 @@ class Settings:
     resource_group_prefix: str = "cortex-sim-"
     allowed_subscriptions: list[str] = field(default_factory=list)
     max_terraform_resources: int = 15
-
+    # ── cobra-tool Live Intel ─────────────────────────────────
+    cobra_tool_enabled: bool = True
+    cobra_tool_github_token: str = ""   # Optional PAT — raises rate limit 60 → 5000/hr
+    cobra_tool_cache_ttl: int = 300     # Seconds before re-checking commit SHA
     # ── Observability ─────────────────────────────────────────────
     log_level: str = "INFO"
 
@@ -106,6 +109,10 @@ def load_settings() -> Settings:
         resource_group_prefix=os.environ.get("RESOURCE_GROUP_PREFIX", "cortex-sim-"),
         allowed_subscriptions=allowed_subs,
         max_terraform_resources=int(os.environ.get("MAX_TERRAFORM_RESOURCES", "15")),
+        # cobra-tool
+        cobra_tool_enabled=os.environ.get("COBRA_TOOL_ENABLED", "true").lower() == "true",
+        cobra_tool_github_token=os.environ.get("COBRA_GITHUB_TOKEN", ""),
+        cobra_tool_cache_ttl=int(os.environ.get("COBRA_TOOL_CACHE_TTL", "300")),
         # Observability
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )
