@@ -10,6 +10,12 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 │                                                               │
 │  START                                                        │
 │    │                                                          │
+│    ▼                                                          │
+│  ┌──────────────────────────────────────┐                     │
+│  │        fetch_cobra_intel             │                     │
+│  │  (GitHub API · SHA cache · CDN fetch)│                     │
+│  └──────────────────────┬───────────────┘                     │
+│    │                    │                                     │
 │    ├── [--prompt provided] ──▶ ┌───────────────────┐          │
 │    │                           │ generate_scenario  │          │
 │    │                           │ (OpenAI → Scenario)│          │
@@ -72,6 +78,7 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 
 ## Features
 
+- **Live cobra-tool Intel** — On every run the orchestrator fetches the latest attack definitions from [PaloAltoNetworks/cobra-tool](https://github.com/PaloAltoNetworks/cobra-tool) via the GitHub API. The LLM receives real-world offensive tooling patterns as supplementary reference alongside its built-in MITRE ATT&CK knowledge. A two-level cache (TTL + commit SHA) keeps overhead minimal; GitHub being unreachable never blocks a run.
 - **Free-Text Prompt Mode** — Describe an attack scenario in natural language; the AI generates a full scenario (cloud provider, MITRE techniques, simulation steps, Terraform hints) on the fly
 - **MITRE ATT&CK Mapping** — AI-powered attack planning with technique IDs
 - **Multi-Cloud** — Azure and AWS scenarios with pluggable cloud provider layer
@@ -241,7 +248,8 @@ azure_cortex_orchestrator/
 │   ├── terraform.py         # Terraform CLI wrapper (incl. plan_json)
 │   ├── azure_helpers.py     # Azure SDK helpers
 │   ├── run_manifest.py      # Crash-recovery run manifest persistence
-│   └── reporting.py         # Report generation
+│   ├── reporting.py         # Report generation
+│   └── cobra_tool.py        # Live GitHub fetcher for cobra-tool intel (SHA cache + CDN)
 ├── templates/
 │   ├── base_infra.tf.j2     # Jinja2 Terraform template (Azure)
 │   └── base_infra_aws.tf.j2 # Jinja2 Terraform template (AWS)
@@ -293,6 +301,25 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 | `ALLOWED_SUBSCRIPTIONS` | No | — | Safety: allowed sub IDs |
 | `MAX_TERRAFORM_RESOURCES` | No | `15` | Safety: max resource count |
 | `LOG_LEVEL` | No | `INFO` | Logging verbosity |
+| `COBRA_TOOL_ENABLED` | No | `true` | Enable/disable live cobra-tool intel |
+| `COBRA_GITHUB_TOKEN` | No | — | GitHub PAT — raises API rate limit 60→5000/hr |
+| `COBRA_TOOL_CACHE_TTL` | No | `300` | Seconds before re-checking cobra-tool commit SHA |
+
+## Live cobra-tool Integration
+
+The orchestrator maintains a **live connection** to [PaloAltoNetworks/cobra-tool](https://github.com/PaloAltoNetworks/cobra-tool), an open-source offensive security framework. At the start of every run, the `fetch_cobra_intel` node:
+
+1. Calls the GitHub API to retrieve the latest commit SHA (1 API call)
+2. If the SHA changed, downloads updated attack definition files via raw CDN (no API quota cost)
+3. Injects the content into `OrchestratorState` as `cobra_intel`
+
+Downstream nodes `plan_attack` and `generate_scenario` automatically append the cobra-tool content to their LLM prompts as a **"Supplementary Reference"** section — the AI draws inspiration from real offensive tool implementations without being constrained to them. The primary planning framework (MITRE ATT&CK mapping, scenario registry) is untouched.
+
+**Two-level cache** prevents redundant work:
+- **TTL cache** — no network calls at all if last fetch was < `COBRA_TOOL_CACHE_TTL` seconds ago
+- **SHA cache** — repo unchanged? TTL is refreshed without re-downloading files
+
+**Graceful degradation** — if GitHub is unreachable, rate-limited, or the token is missing, the run continues exactly as before with no cobra intel. The integration is also disableable via `COBRA_TOOL_ENABLED=false`.
 
 ## Reports
 
