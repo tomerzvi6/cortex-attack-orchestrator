@@ -214,7 +214,7 @@ def review_plan(state: OrchestratorState) -> dict[str, Any]:
 
         log.info("User approved attack plan")
         print("  Continuing...")
-        return {}
+        return {"replan_requested": False}
 
 
 # ══════════════════════════════════════════════════════════════════

@@ -28,7 +28,7 @@ class Settings:
 
     # ── OpenAI ────────────────────────────────────────────────────
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini-mini"
+    openai_model: str = "gpt-4o-mini"
 
     # ── Azure Service Principal ───────────────────────────────────
     azure_client_id: str = ""

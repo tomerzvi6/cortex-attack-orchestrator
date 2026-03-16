@@ -1,0 +1,84 @@
+{#
+  Scenario: AWS IAM Privilege Escalation via Policy Attachment
+
+  Deploys:
+    - IAM user with iam:AttachUserPolicy permission (misconfiguration)
+    - IAM access key for the user
+    - Inline policy granting escalation-capable permissions
+
+  Variables:
+    - run_id: Unique run identifier
+    - region: AWS region (default: us-east-1)
+    - resource_name_prefix: Prefix for resource naming
+#}
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "{{ region | default('us-east-1') }}"
+
+  default_tags {
+    tags = {
+      environment = "cortex-simulation"
+      run_id      = "{{ run_id }}"
+      managed_by  = "azure-cortex-orchestrator"
+    }
+  }
+}
+
+# ── IAM User (attacker) ─────────────────────────────────────────
+resource "aws_iam_user" "sim" {
+  name          = "{{ resource_name_prefix }}user"
+  force_destroy = true
+}
+
+# ── Access Key for the user ──────────────────────────────────────
+resource "aws_iam_access_key" "sim" {
+  user = aws_iam_user.sim.name
+}
+
+# ── VULNERABLE: Inline policy with iam:AttachUserPolicy ──────────
+# Allows the user to attach any managed policy to themselves.
+resource "aws_iam_user_policy" "sim" {
+  name = "{{ resource_name_prefix }}escalation-policy"
+  user = aws_iam_user.sim.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowPolicyAttachment"
+        Effect = "Allow"
+        Action = [
+          "iam:AttachUserPolicy",
+          "iam:ListAttachedUserPolicies",
+          "iam:ListPolicies",
+          "iam:GetUser",
+          "iam:GetPolicy"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "iam_user_name" {
+  value = aws_iam_user.sim.name
+}
+
+output "access_key_id" {
+  value = aws_iam_access_key.sim.id
+}
+
+output "secret_access_key" {
+  value     = aws_iam_access_key.sim.secret
+  sensitive = true
+}

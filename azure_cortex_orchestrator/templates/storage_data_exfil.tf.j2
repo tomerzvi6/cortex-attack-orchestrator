@@ -1,0 +1,140 @@
+{#
+  Scenario: Storage Account Data Exfiltration via SAS Token
+
+  Deploys:
+    - Resource Group
+    - Storage Account (public access enabled — misconfiguration)
+    - Storage Container (public blob access)
+    - Storage Blob (inline content, simulated PII)
+    - User-Assigned Identity with Storage Blob Data Reader
+    - Log Analytics Workspace
+    - Diagnostic Setting on blob service (StorageRead/Write/Delete)
+
+  Variables:
+    - resource_group_name: Name of the resource group
+    - location: Azure region (default: eastus)
+    - subscription_id: Azure subscription ID
+    - run_id: Unique run identifier
+#}
+
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = "{{ subscription_id }}"
+}
+
+# ── Resource Group ────────────────────────────────────────────────
+resource "azurerm_resource_group" "sim" {
+  name     = "{{ resource_group_name }}"
+  location = "{{ location | default('eastus') }}"
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+    managed_by  = "azure-cortex-orchestrator"
+  }
+}
+
+# ── VULNERABLE: Storage Account with public access ────────────────
+resource "azurerm_storage_account" "sim" {
+  name                            = "cortexsim{{ run_id[:8] | replace('-', '') }}"
+  resource_group_name             = azurerm_resource_group.sim.name
+  location                        = azurerm_resource_group.sim.location
+  account_tier                    = "Standard"
+  account_replication_type        = "LRS"
+  allow_nested_items_to_be_public = true
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+  }
+}
+
+# ── Storage Container (public blob access) ────────────────────────
+resource "azurerm_storage_container" "sim" {
+  name                  = "sensitive-data"
+  storage_account_name  = azurerm_storage_account.sim.name
+  container_access_type = "blob"
+}
+
+# ── Storage Blob (simulated sensitive data — inline content) ──────
+resource "azurerm_storage_blob" "sim" {
+  name                   = "pii-records.csv"
+  storage_account_name   = azurerm_storage_account.sim.name
+  storage_container_name = azurerm_storage_container.sim.name
+  type                   = "Block"
+  source_content         = "id,name,email,ssn\n1,John Doe,john@example.com,123-45-6789\n2,Jane Smith,jane@example.com,987-65-4321\n3,Bob Wilson,bob@example.com,456-78-9012\n"
+}
+
+# ── User-Assigned Identity (attacker with read access) ────────────
+resource "azurerm_user_assigned_identity" "sim" {
+  name                = "{{ resource_group_name }}-attacker"
+  resource_group_name = azurerm_resource_group.sim.name
+  location            = azurerm_resource_group.sim.location
+}
+
+# ── Role Assignment: Storage Blob Data Reader ─────────────────────
+resource "azurerm_role_assignment" "sim" {
+  scope                = azurerm_storage_account.sim.id
+  role_definition_name = "Storage Blob Data Reader"
+  principal_id         = azurerm_user_assigned_identity.sim.principal_id
+}
+
+# ── Log Analytics Workspace ──────────────────────────────────────
+resource "azurerm_log_analytics_workspace" "sim" {
+  name                = "{{ resource_group_name }}-law"
+  location            = azurerm_resource_group.sim.location
+  resource_group_name = azurerm_resource_group.sim.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+# ── Diagnostic Setting on Blob Service ────────────────────────────
+# target_resource_id MUST point to /blobServices/default, NOT the account.
+# Categories MUST be StorageRead/StorageWrite/StorageDelete, NOT Read/Write/Delete.
+resource "azurerm_monitor_diagnostic_setting" "storage_diagnostics" {
+  name                       = "storage-blob-diagnostics"
+  target_resource_id         = "${azurerm_storage_account.sim.id}/blobServices/default"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.sim.id
+
+  enabled_log {
+    category = "StorageRead"
+  }
+
+  enabled_log {
+    category = "StorageWrite"
+  }
+
+  enabled_log {
+    category = "StorageDelete"
+  }
+
+  metric {
+    category = "Transaction"
+  }
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "resource_group_name" {
+  value = azurerm_resource_group.sim.name
+}
+
+output "storage_account_name" {
+  value = azurerm_storage_account.sim.name
+}
+
+output "storage_container_name" {
+  value = azurerm_storage_container.sim.name
+}
+
+output "log_analytics_workspace_id" {
+  value = azurerm_log_analytics_workspace.sim.id
+}

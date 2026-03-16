@@ -65,8 +65,11 @@ class SimulatedValidator(BaseValidator):
             window_minutes = 15
 
         # Query Azure Activity Log
+        resource_group = state.get("resource_group_name", "")
         try:
-            found_operations = self._check_activity_log(expected_ops, window_minutes)
+            found_operations = self._check_activity_log(
+                expected_ops, window_minutes, resource_group,
+            )
         except Exception as exc:
             logger.error("Failed to query Activity Log: %s", exc)
             return ValidationResult(
@@ -116,6 +119,7 @@ class SimulatedValidator(BaseValidator):
         self,
         expected_operations: list[str],
         window_minutes: int,
+        resource_group: str = "",
     ) -> list[dict]:
         """
         Query Azure Activity Log for matching operations.
@@ -127,11 +131,13 @@ class SimulatedValidator(BaseValidator):
         now = datetime.now(timezone.utc)
         start_time = now - timedelta(minutes=window_minutes)
 
-        # Build OData filter
+        # Build OData filter — scope to resource group when available
         filter_str = (
             f"eventTimestamp ge '{start_time.isoformat()}' "
             f"and eventTimestamp le '{now.isoformat()}'"
         )
+        if resource_group:
+            filter_str += f" and resourceGroupName eq '{resource_group}'"
 
         logger.info("Querying Activity Log with filter: %s", filter_str)
         events = monitor_client.activity_logs.list(filter=filter_str)

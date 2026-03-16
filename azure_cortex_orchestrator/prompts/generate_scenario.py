@@ -11,22 +11,17 @@ Terraform hints, simulation steps, and detection expectations.
 SUPPORTED_SDK_ACTIONS: dict[str, list[str]] = {
     "azure": [
         "identity.authenticate",
-        "monitor.diagnostic_settings.delete",
+        "resource.list",
         "monitor.diagnostic_settings.list",
+        "monitor.diagnostic_settings.delete",
         "authorization.role_assignments.list",
         "authorization.role_assignments.create",
-        "authorization.role_assignments.delete",
         "authorization.role_definitions.list",
-        "storage.blob_containers.list",
+        "storage.authenticate",
+        "storage.containers.list",
+        "storage.blobs.list",
         "storage.blobs.download",
-        "storage.blobs.upload",
-        "storage.blobs.delete",
-        "compute.virtual_machines.list",
-        "compute.virtual_machines.run_command",
-        "network.security_groups.list",
-        "network.security_groups.update",
-        "keyvault.secrets.list",
-        "keyvault.secrets.get",
+        "storage.account.generateSas",
     ],
     "aws": [
         "sts.get_caller_identity",
@@ -70,42 +65,42 @@ in plain English. Your job is to convert it into a fully structured scenario \
 definition that can drive an automated attack simulation.
 
 You MUST respond with valid JSON (no other text) in this exact format:
-{{{{
+{{
   "id": "short_snake_case_id",
   "name": "Human Readable Scenario Name",
   "description": "2-3 sentence description of the attack",
   "goal_template": "Natural language attack goal for the LLM planner",
   "cloud_provider": "azure" or "aws",
   "expected_mitre_techniques": [
-    {{{{
+    {{
       "id": "T1234.001",
       "name": "Technique Name",
       "description": "How this technique applies",
       "tactic": "Tactic Name",
       "url": "https://attack.mitre.org/techniques/T1234/001/"
-    }}}}
+    }}
   ],
-  "terraform_hints": {{{{
+  "terraform_hints": {{
     "resource_types": ["azurerm_resource_group", "..."],
     "misconfigurations": ["Description of the deliberate vulnerability"],
     "region": "eastus"
-  }}}},
+  }},
   "simulation_steps": [
-    {{{{
+    {{
       "order": 1,
       "name": "step_name_snake_case",
       "description": "What this step does",
       "sdk_action": "service.action_name",
       "target_resource_type": "Microsoft.Resource/Type or AWS::Service::Resource"
-    }}}}
+    }}
   ],
-  "detection_expectations": {{{{
+  "detection_expectations": {{
     "expected_activity_log_operations": ["Microsoft.xxx/yyy/write"],
     "expected_alert_types": ["Description of expected alert"],
     "cortex_xdr_expected_alerts": ["Cortex XDR alert name"],
     "detection_window_minutes": 10
-  }}}}
-}}}}
+  }}
+}}
 
 CRITICAL RULES:
 1. The "cloud_provider" MUST be either "azure" or "aws".

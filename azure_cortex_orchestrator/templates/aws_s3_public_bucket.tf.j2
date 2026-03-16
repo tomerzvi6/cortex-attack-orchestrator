@@ -1,0 +1,106 @@
+{#
+  Scenario: AWS S3 Public Bucket Data Exposure
+
+  Deploys:
+    - S3 bucket with public access enabled (misconfiguration)
+    - Public access block disabled
+    - S3 object with inline simulated sensitive data
+    - IAM role for simulation
+
+  Variables:
+    - run_id: Unique run identifier
+    - region: AWS region (default: us-east-1)
+    - resource_name_prefix: Prefix for resource naming
+#}
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "{{ region | default('us-east-1') }}"
+
+  default_tags {
+    tags = {
+      environment = "cortex-simulation"
+      run_id      = "{{ run_id }}"
+      managed_by  = "azure-cortex-orchestrator"
+    }
+  }
+}
+
+# ── S3 Bucket ─────────────────────────────────────────────────────
+resource "aws_s3_bucket" "sim" {
+  bucket        = "{{ resource_name_prefix }}{{ run_id[:8] }}"
+  force_destroy = true
+}
+
+# ── VULNERABLE: Public Access Block disabled ──────────────────────
+resource "aws_s3_bucket_public_access_block" "sim" {
+  bucket = aws_s3_bucket.sim.id
+
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
+# ── Ownership Controls (required for public ACL) ─────────────────
+resource "aws_s3_bucket_ownership_controls" "sim" {
+  bucket = aws_s3_bucket.sim.id
+
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+
+  depends_on = [aws_s3_bucket_public_access_block.sim]
+}
+
+# ── VULNERABLE: Public-Read ACL ──────────────────────────────────
+resource "aws_s3_bucket_acl" "sim" {
+  bucket = aws_s3_bucket.sim.id
+  acl    = "public-read"
+
+  depends_on = [aws_s3_bucket_ownership_controls.sim]
+}
+
+# ── S3 Object (simulated sensitive data — inline content) ─────────
+resource "aws_s3_object" "sensitive_data" {
+  bucket  = aws_s3_bucket.sim.id
+  key     = "sensitive-data/pii-records.csv"
+  content = "id,name,email,ssn\n1,John Doe,john@example.com,123-45-6789\n2,Jane Smith,jane@example.com,987-65-4321\n3,Bob Wilson,bob@example.com,456-78-9012\n"
+
+  depends_on = [aws_s3_bucket_acl.sim]
+}
+
+# ── IAM Role (simulation identity) ───────────────────────────────
+resource "aws_iam_role" "sim" {
+  name = "{{ resource_name_prefix }}role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "s3_bucket_name" {
+  value = aws_s3_bucket.sim.id
+}
+
+output "iam_role_arn" {
+  value = aws_iam_role.sim.arn
+}

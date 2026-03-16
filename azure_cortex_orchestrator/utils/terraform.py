@@ -135,7 +135,8 @@ class TerraformRunner:
             self.init()
 
         logger.info("Running terraform plan")
-        result = self._run(["plan", "-no-color", "-detailed-exitcode"], check=False)
+        # Added -lock=false to avoid improved concurrency issues on Windows
+        result = self._run(["plan", "-no-color", "-detailed-exitcode", "-lock=false"], check=False)
 
         # Exit code 0 = no changes, 1 = error, 2 = changes present
         if result.returncode == 1:
@@ -163,7 +164,7 @@ class TerraformRunner:
 
         logger.info("Running terraform plan -out (for JSON analysis)")
         result = self._run(
-            ["plan", "-no-color", "-detailed-exitcode", f"-out={plan_file}"],
+            ["plan", "-no-color", "-detailed-exitcode", "-lock=false", f"-out={plan_file}"],
             check=False,
         )
         if result.returncode == 1:
@@ -206,7 +207,7 @@ class TerraformRunner:
 
         logger.info("Running terraform apply (auto_approve=%s)", auto_approve)
         result = self._run(
-            ["apply", "-auto-approve", "-no-color"],
+            ["apply", "-auto-approve", "-no-color", "-lock=false"],
             timeout=600,
         )
         logger.info("terraform apply completed")
@@ -225,7 +226,7 @@ class TerraformRunner:
         if not self._initialized:
             self.init()
 
-        args = ["destroy", "-no-color"]
+        args = ["destroy", "-no-color", "-lock=false"]
         if auto_approve:
             args.append("-auto-approve")
 

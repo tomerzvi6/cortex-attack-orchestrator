@@ -10,7 +10,6 @@ from __future__ import annotations
 from azure.identity import ClientSecretCredential
 from azure.mgmt.monitor import MonitorManagementClient
 from azure.mgmt.resource import ResourceManagementClient
-from azure.mgmt.resource.subscriptions import SubscriptionClient
 
 from azure_cortex_orchestrator.config import Settings
 from azure_cortex_orchestrator.utils.observability import get_logger
@@ -45,12 +44,6 @@ def get_monitor_client(settings: Settings) -> MonitorManagementClient:
     """Create an Azure MonitorManagementClient."""
     credential = get_credential(settings)
     return MonitorManagementClient(credential, settings.azure_subscription_id)
-
-
-def get_subscription_client(settings: Settings) -> SubscriptionClient:
-    """Create an Azure SubscriptionClient."""
-    credential = get_credential(settings)
-    return SubscriptionClient(credential)
 
 
 def get_terraform_azure_env(settings: Settings) -> dict[str, str]:

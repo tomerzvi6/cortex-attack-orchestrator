@@ -1,0 +1,206 @@
+{#
+  Scenario: EC2 Instance Role — Delete CloudTrail Logs
+
+  Deploys:
+    - VPC + Subnet + Security Group
+    - EC2 instance with instance profile
+    - IAM role with AdministratorAccess (misconfiguration)
+    - S3 bucket for CloudTrail
+    - CloudTrail trail
+    - CloudWatch Log Group
+
+  Variables:
+    - run_id: Unique run identifier
+    - region: AWS region (default: us-east-1)
+    - resource_name_prefix: Prefix for resource naming
+#}
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "{{ region | default('us-east-1') }}"
+
+  default_tags {
+    tags = {
+      environment = "cortex-simulation"
+      run_id      = "{{ run_id }}"
+      managed_by  = "azure-cortex-orchestrator"
+    }
+  }
+}
+
+# ── Data: current account ID ─────────────────────────────────────
+data "aws_caller_identity" "current" {}
+
+# ── Data: latest Amazon Linux 2023 AMI ───────────────────────────
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+}
+
+# ── VPC ──────────────────────────────────────────────────────────
+resource "aws_vpc" "sim" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "{{ resource_name_prefix }}vpc"
+  }
+}
+
+resource "aws_subnet" "sim" {
+  vpc_id     = aws_vpc.sim.id
+  cidr_block = "10.0.1.0/24"
+
+  tags = {
+    Name = "{{ resource_name_prefix }}subnet"
+  }
+}
+
+resource "aws_security_group" "sim" {
+  name_prefix = "{{ resource_name_prefix }}sg-"
+  vpc_id      = aws_vpc.sim.id
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "{{ resource_name_prefix }}sg"
+  }
+}
+
+# ── VULNERABLE: IAM Role with AdministratorAccess ─────────────────
+resource "aws_iam_role" "sim" {
+  name = "{{ resource_name_prefix }}ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "ec2.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "admin" {
+  role       = aws_iam_role.sim.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+}
+
+resource "aws_iam_instance_profile" "sim" {
+  name = "{{ resource_name_prefix }}ec2-profile"
+  role = aws_iam_role.sim.name
+}
+
+# ── EC2 Instance ─────────────────────────────────────────────────
+resource "aws_instance" "sim" {
+  ami                  = data.aws_ami.amazon_linux.id
+  instance_type        = "t3.micro"
+  subnet_id            = aws_subnet.sim.id
+  iam_instance_profile = aws_iam_instance_profile.sim.name
+
+  vpc_security_group_ids = [aws_security_group.sim.id]
+
+  tags = {
+    Name = "{{ resource_name_prefix }}ec2"
+  }
+}
+
+# ── S3 Bucket for CloudTrail ─────────────────────────────────────
+resource "aws_s3_bucket" "trail" {
+  bucket        = "{{ resource_name_prefix }}trail-{{ run_id[:8] }}"
+  force_destroy = true
+}
+
+resource "aws_s3_bucket_policy" "trail" {
+  bucket = aws_s3_bucket.trail.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AWSCloudTrailAclCheck"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:GetBucketAcl"
+        Resource = aws_s3_bucket.trail.arn
+      },
+      {
+        Sid    = "AWSCloudTrailWrite"
+        Effect = "Allow"
+        Principal = {
+          Service = "cloudtrail.amazonaws.com"
+        }
+        Action   = "s3:PutObject"
+        Resource = "${aws_s3_bucket.trail.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
+        Condition = {
+          StringEquals = {
+            "s3:x-amz-acl" = "bucket-owner-full-control"
+          }
+        }
+      }
+    ]
+  })
+}
+
+# ── CloudTrail (target for deletion) ─────────────────────────────
+resource "aws_cloudtrail" "sim" {
+  name                          = "{{ resource_name_prefix }}trail"
+  s3_bucket_name                = aws_s3_bucket.trail.id
+  include_global_service_events = true
+  is_multi_region_trail         = false
+
+  depends_on = [aws_s3_bucket_policy.trail]
+}
+
+# ── CloudWatch Log Group ─────────────────────────────────────────
+resource "aws_cloudwatch_log_group" "sim" {
+  name              = "/cortex-sim/{{ run_id[:8] }}"
+  retention_in_days = 1
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "instance_id" {
+  value = aws_instance.sim.id
+}
+
+output "iam_role_arn" {
+  value = aws_iam_role.sim.arn
+}
+
+output "trail_name" {
+  value = aws_cloudtrail.sim.name
+}
+
+output "trail_s3_bucket" {
+  value = aws_s3_bucket.trail.id
+}

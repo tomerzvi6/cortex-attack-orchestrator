@@ -1,0 +1,129 @@
+{#
+  Scenario: IAM Privilege Escalation via Custom Role
+
+  Deploys:
+    - Resource Group
+    - User-Assigned Managed Identity (attacker identity)
+    - Custom Role with Microsoft.Authorization/roleAssignments/write (misconfiguration)
+    - Role Assignment binding the custom role to the identity
+    - Log Analytics Workspace + diagnostic setting for monitoring
+
+  Variables:
+    - resource_group_name: Name of the resource group
+    - location: Azure region (default: eastus)
+    - subscription_id: Azure subscription ID
+    - run_id: Unique run identifier
+#}
+
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = "{{ subscription_id }}"
+}
+
+# ── Resource Group ────────────────────────────────────────────────
+resource "azurerm_resource_group" "sim" {
+  name     = "{{ resource_group_name }}"
+  location = "{{ location | default('eastus') }}"
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+    managed_by  = "azure-cortex-orchestrator"
+  }
+}
+
+# ── User-Assigned Managed Identity (attacker) ─────────────────────
+resource "azurerm_user_assigned_identity" "sim" {
+  name                = "{{ resource_group_name }}-attacker"
+  resource_group_name = azurerm_resource_group.sim.name
+  location            = azurerm_resource_group.sim.location
+
+  tags = {
+    environment = "cortex-simulation"
+    run_id      = "{{ run_id }}"
+  }
+}
+
+# ── VULNERABLE: Custom Role with roleAssignments/write ────────────
+# This is intentionally over-privileged for the simulation.
+resource "azurerm_role_definition" "sim" {
+  name        = "{{ resource_group_name }}-custom-role"
+  scope       = "/subscriptions/{{ subscription_id }}"
+  description = "Custom role with role assignment write — cortex simulation"
+
+  permissions {
+    actions = [
+      "Microsoft.Authorization/roleAssignments/write",
+      "Microsoft.Authorization/roleAssignments/read",
+      "Microsoft.Authorization/roleAssignments/delete",
+      "Microsoft.Authorization/roleDefinitions/read",
+      "Microsoft.Resources/subscriptions/resourceGroups/read",
+    ]
+    not_actions = []
+  }
+
+  assignable_scopes = [
+    "/subscriptions/{{ subscription_id }}"
+  ]
+}
+
+# ── Role Assignment: custom role → attacker identity ──────────────
+resource "azurerm_role_assignment" "sim" {
+  scope              = "/subscriptions/{{ subscription_id }}"
+  role_definition_id = azurerm_role_definition.sim.role_definition_resource_id
+  principal_id       = azurerm_user_assigned_identity.sim.principal_id
+}
+
+# ── Log Analytics Workspace ──────────────────────────────────────
+resource "azurerm_log_analytics_workspace" "sim" {
+  name                = "{{ resource_group_name }}-law"
+  location            = azurerm_resource_group.sim.location
+  resource_group_name = azurerm_resource_group.sim.name
+  sku                 = "PerGB2018"
+  retention_in_days   = 30
+}
+
+# ── Diagnostic Setting (Activity Log → Log Analytics) ─────────────
+resource "azurerm_monitor_diagnostic_setting" "activity_logs" {
+  name                       = "activity-log-to-law"
+  target_resource_id         = "/subscriptions/{{ subscription_id }}"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.sim.id
+
+  enabled_log {
+    category = "Administrative"
+  }
+
+  enabled_log {
+    category = "Security"
+  }
+}
+
+# ── Outputs ──────────────────────────────────────────────────────
+output "resource_group_name" {
+  value = azurerm_resource_group.sim.name
+}
+
+output "identity_principal_id" {
+  value = azurerm_user_assigned_identity.sim.principal_id
+}
+
+output "identity_client_id" {
+  value = azurerm_user_assigned_identity.sim.client_id
+}
+
+output "custom_role_id" {
+  value = azurerm_role_definition.sim.role_definition_resource_id
+}
+
+output "log_analytics_workspace_id" {
+  value = azurerm_log_analytics_workspace.sim.id
+}

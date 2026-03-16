@@ -53,6 +53,36 @@ class RunManifest:
         self.manifest_dir.mkdir(parents=True, exist_ok=True)
         self._write()
 
+    @classmethod
+    def load(cls, manifest_dir: Path, run_id: str) -> "RunManifest":
+        """Load an existing manifest from disk without overwriting it."""
+        instance = object.__new__(cls)
+        instance.manifest_dir = manifest_dir
+        instance.run_id = run_id
+        instance.manifest_path = manifest_dir / f"run-{run_id}.manifest.json"
+        if instance.manifest_path.exists():
+            instance._data = json.loads(
+                instance.manifest_path.read_text(encoding="utf-8")
+            )
+        else:
+            # Fall back to creating a new manifest
+            instance._data = {
+                "run_id": run_id,
+                "status": "initialized",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "scenario_id": "",
+                "cloud_provider": "",
+                "terraform_working_dir": "",
+                "deploy_status": "pending",
+                "teardown_completed": False,
+                "erasure_validated": False,
+                "events": [],
+            }
+            instance.manifest_dir.mkdir(parents=True, exist_ok=True)
+            instance._write()
+        return instance
+
     def update(self, **kwargs: Any) -> None:
         """Update manifest fields and persist to disk."""
         self._data["updated_at"] = datetime.now(timezone.utc).isoformat()

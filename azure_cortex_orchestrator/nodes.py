@@ -182,7 +182,8 @@ def _call_openai(
 # Prices per 1K tokens (USD). Update as OpenAI publishes new prices.
 _MODEL_PRICING: dict[str, tuple[float, float]] = {
     # (prompt_per_1k, completion_per_1k)
-    "gpt-4o-mini": (0.03, 0.06)
+    "gpt-4o-mini": (0.00015, 0.0006),
+    "gpt-4o": (0.005, 0.015),
 }
 
 
@@ -485,6 +486,58 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════
 
 
+def _sanitize_terraform_code(code: str) -> str:
+    """Post-process LLM-generated Terraform to fix known bad patterns.
+
+    The LLM frequently generates deprecated or invalid arguments that cause
+    ``terraform plan``/``apply`` to fail.  We fix them deterministically here
+    so the self-healing retry loop doesn't waste attempts on preventable errors.
+    """
+
+    # 1. Remove deprecated `allow_blob_public_access` (azurerm >= 3.0)
+    code = re.sub(
+        r'^\s*allow_blob_public_access\s*=\s*\S+\s*\n',
+        '',
+        code,
+        flags=re.MULTILINE,
+    )
+
+    # 2. Replace `source = "..."` with `source_content` in azurerm_storage_blob
+    #    to avoid referencing local files that don't exist.
+    code = re.sub(
+        r'(resource\s+"azurerm_storage_blob"[^}]*?)'
+        r'source\s*=\s*"[^"]*"',
+        r'\1source_content = "simulated-sensitive-data"',
+        code,
+        flags=re.DOTALL,
+    )
+
+    # 3. Fix diagnostic setting log categories for storage accounts.
+    #    Azure storage requires StorageRead/StorageWrite/StorageDelete,
+    #    not Read/Write/Delete.
+    _STORAGE_DIAG_CAT_MAP = {
+        '"Read"': '"StorageRead"',
+        '"Write"': '"StorageWrite"',
+        '"Delete"': '"StorageDelete"',
+    }
+    # Only replace inside azurerm_monitor_diagnostic_setting blocks
+    def _fix_diag_block(m: re.Match) -> str:
+        block = m.group(0)
+        for old, new in _STORAGE_DIAG_CAT_MAP.items():
+            block = block.replace(f'category       = {old}', f'category       = {new}')
+            block = block.replace(f'category = {old}', f'category = {new}')
+        return block
+
+    code = re.sub(
+        r'resource\s+"azurerm_monitor_diagnostic_setting"[^}]*(?:\{[^}]*\}[^}]*)*\}',
+        _fix_diag_block,
+        code,
+        flags=re.DOTALL,
+    )
+
+    return code
+
+
 def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
     """
     Node: Generate Terraform code for the vulnerable Azure environment.
@@ -519,13 +572,13 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             llm_usage = list(state.get("llm_usage", []))
             llm_usage.append(usage_record)
         else:
-            # ── First run: generate from scratch ──────────────────
-            # Load the Jinja2 base template based on cloud provider
+            # ── First run ───────────────────────────────────────────
             templates_dir = Path(__file__).resolve().parent / "templates"
             jinja_env = Environment(loader=FileSystemLoader(str(templates_dir)))
 
-            # Determine cloud provider for template selection
+            # Determine cloud provider
             cloud_provider = "azure"
+            scenario = None
             try:
                 registry = ScenarioRegistry.get_instance()
                 scenario = registry.get(scenario_id)
@@ -533,70 +586,119 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             except KeyError:
                 pass
 
-            template_context = ""
-            try:
-                template_name = (
-                    "base_infra_aws.tf.j2"
-                    if cloud_provider == "aws"
-                    else "base_infra.tf.j2"
+            # ── Template-direct path: use pre-validated scenario template
+            scenario_template_name = f"{scenario_id}.tf.j2"
+            scenario_template_exists = (
+                scenario_id != "custom"
+                and (templates_dir / scenario_template_name).is_file()
+            )
+
+            if scenario_template_exists:
+                log.info(
+                    "Using pre-validated template: %s",
+                    scenario_template_name,
                 )
-                template = jinja_env.get_template(template_name)
+                template = jinja_env.get_template(scenario_template_name)
+
+                region = (
+                    scenario.terraform_hints.get("region", "eastus")
+                    if scenario
+                    else "eastus"
+                )
 
                 if cloud_provider == "aws":
-                    rendered = template.render(
+                    terraform_code = template.render(
                         resource_name_prefix="cortex-sim-",
                         run_id=run_id,
-                        region="us-east-1",
+                        region=region,
                     )
                 else:
-                    rendered = template.render(
+                    terraform_code = template.render(
                         resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
                         subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
                         run_id=run_id,
-                        location="eastus",
+                        location=region,
                         vm_name=f"sim-vm-{run_id[:8]}",
+                        admin_username="simadmin",
                     )
-                template_context = f"\n\nHere's a reference template to guide your output:\n```hcl\n{rendered}\n```"
-            except Exception as exc:
-                log.warning("Failed to render Jinja2 template: %s", exc)
 
-            # Get scenario hints
-            scenario_hints = ""
-            try:
-                registry = ScenarioRegistry.get_instance()
-                scenario = registry.get(scenario_id)
-                scenario_hints = (
-                    f"\n\nScenario requirements:\n"
-                    f"- Resources: {scenario.terraform_hints.get('resource_types', [])}\n"
-                    f"- Role assignments: {scenario.terraform_hints.get('role_assignments', [])}\n"
-                    f"- Misconfigurations: {scenario.terraform_hints.get('misconfigurations', [])}\n"
-                    f"- Region: {scenario.terraform_hints.get('region', 'eastus')}\n"
+                llm_usage = list(state.get("llm_usage", []))
+                # No LLM call — no usage record
+
+            else:
+                # ── LLM fallback: custom/freeform prompts ───────────
+                log.info(
+                    "No scenario template for '%s' — using LLM generation",
+                    scenario_id,
                 )
-            except KeyError:
-                pass
 
-            user_prompt = (
-                f"Attack Plan:\n{json.dumps(attack_plan, indent=2)}\n"
-                f"{scenario_hints}"
-                f"{template_context}\n\n"
-                f"Subscription ID: {settings.azure_subscription_id or 'SUBSCRIPTION_ID'}\n"
-                f"Resource Group Prefix: {settings.resource_group_prefix}\n"
-                f"Run ID: {run_id}"
-            )
+                template_context = ""
+                try:
+                    base_template_name = (
+                        "base_infra_aws.tf.j2"
+                        if cloud_provider == "aws"
+                        else "base_infra.tf.j2"
+                    )
+                    template = jinja_env.get_template(base_template_name)
 
-            log.info(
-                "Calling OpenAI to generate Terraform (first run)"
-            )
-            response, usage_record = _call_openai(
-                GENERATE_INFRA_SYSTEM_PROMPT,
-                user_prompt,
-                max_tokens=8192,
-                node_name="generate_infrastructure",
-            )
+                    if cloud_provider == "aws":
+                        rendered = template.render(
+                            resource_name_prefix="cortex-sim-",
+                            run_id=run_id,
+                            region="us-east-1",
+                        )
+                    else:
+                        rendered = template.render(
+                            resource_group_name=f"{settings.resource_group_prefix}{run_id[:8]}",
+                            subscription_id=settings.azure_subscription_id or "SUBSCRIPTION_ID",
+                            run_id=run_id,
+                            location="eastus",
+                            vm_name=f"sim-vm-{run_id[:8]}",
+                        )
+                    template_context = f"\n\nHere's a reference template to guide your output:\n```hcl\n{rendered}\n```"
+                except Exception as exc:
+                    log.warning("Failed to render Jinja2 template: %s", exc)
 
-            terraform_code = _extract_hcl(response)
-            llm_usage = list(state.get("llm_usage", []))
-            llm_usage.append(usage_record)
+                # Get scenario hints
+                scenario_hints = ""
+                try:
+                    registry = ScenarioRegistry.get_instance()
+                    scenario = registry.get(scenario_id)
+                    scenario_hints = (
+                        f"\n\nScenario requirements:\n"
+                        f"- Resources: {scenario.terraform_hints.get('resource_types', [])}\n"
+                        f"- Role assignments: {scenario.terraform_hints.get('role_assignments', [])}\n"
+                        f"- Misconfigurations: {scenario.terraform_hints.get('misconfigurations', [])}\n"
+                        f"- Region: {scenario.terraform_hints.get('region', 'eastus')}\n"
+                    )
+                except KeyError:
+                    pass
+
+                user_prompt = (
+                    f"Attack Plan:\n{json.dumps(attack_plan, indent=2)}\n"
+                    f"{scenario_hints}"
+                    f"{template_context}\n\n"
+                    f"Subscription ID: {settings.azure_subscription_id or 'SUBSCRIPTION_ID'}\n"
+                    f"Resource Group Prefix: {settings.resource_group_prefix}\n"
+                    f"Run ID: {run_id}"
+                )
+
+                log.info(
+                    "Calling OpenAI to generate Terraform (first run)"
+                )
+                response, usage_record = _call_openai(
+                    GENERATE_INFRA_SYSTEM_PROMPT,
+                    user_prompt,
+                    max_tokens=8192,
+                    node_name="generate_infrastructure",
+                )
+
+                terraform_code = _extract_hcl(response)
+                llm_usage = list(state.get("llm_usage", []))
+                llm_usage.append(usage_record)
+
+        # ── Sanitize known bad patterns before writing ────────────
+        terraform_code = _sanitize_terraform_code(terraform_code)
 
         # Set up Terraform working directory
         tf_runner = TerraformRunner(
@@ -937,8 +1039,9 @@ def deploy_infrastructure(state: OrchestratorState) -> dict[str, Any]:
             plan_output = tf_runner.plan()
             log.info("Terraform plan output:\n%s", plan_output[:1000])
 
-            # Apply with confirmation
-            tf_runner.apply(auto_approve=False)
+            # Apply — only prompt for confirmation in CLI interactive mode
+            interactive = state.get("interactive", False)
+            tf_runner.apply(auto_approve=not interactive)
 
             log.info("Infrastructure deployed successfully")
 
@@ -1231,7 +1334,7 @@ def teardown(state: OrchestratorState) -> dict[str, Any]:
             log.info("Infrastructure destroyed successfully")
 
             # Update run manifest to reflect successful teardown
-            manifest = RunManifest(
+            manifest = RunManifest.load(
                 manifest_dir=settings.reports_dir,
                 run_id=run_id,
             )
@@ -1293,7 +1396,7 @@ def erasure_validator(state: OrchestratorState) -> dict[str, Any]:
 
         # Update run manifest with erasure result
         try:
-            manifest = RunManifest(
+            manifest = RunManifest.load(
                 manifest_dir=settings.reports_dir,
                 run_id=state.get("run_id", "unknown"),
             )
