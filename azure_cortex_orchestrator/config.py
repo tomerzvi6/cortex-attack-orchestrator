@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 
 # Load .env file if present (project root)
 _env_path = Path(__file__).resolve().parent.parent / ".env"
-load_dotenv(dotenv_path=_env_path, override=False)
+load_dotenv(dotenv_path=_env_path, override=True)
 
 
 class ConfigError(Exception):
@@ -28,7 +28,7 @@ class Settings:
 
     # ── OpenAI ────────────────────────────────────────────────────
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
+    openai_model: str = "gpt-5-mini"
 
     # ── Azure Service Principal ───────────────────────────────────
     azure_client_id: str = ""
@@ -48,6 +48,14 @@ class Settings:
     cobra_tool_enabled: bool = True
     cobra_tool_github_token: str = ""   # Optional PAT — raises rate limit 60 → 5000/hr
     cobra_tool_cache_ttl: int = 300     # Seconds before re-checking commit SHA
+    # ── MITRE ATT&CK Live Intel ───────────────────────────────
+    mitre_tool_enabled: bool = True
+    mitre_tool_github_token: str = ""   # Optional PAT (shared with cobra if not set)
+    mitre_tool_cache_ttl: int = 3600    # Default 1 hour — MITRE data changes rarely
+    # ── Terraform Schema Live Intel ───────────────────────────
+    tf_schema_tool_enabled: bool = True
+    tf_schema_github_token: str = ""    # Optional PAT
+    tf_schema_cache_ttl: int = 3600     # Default 1 hour
     # ── Observability ─────────────────────────────────────────────
     log_level: str = "INFO"
 
@@ -96,7 +104,7 @@ def load_settings() -> Settings:
     return Settings(
         # OpenAI
         openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
-        openai_model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
+        openai_model=os.environ.get("OPENAI_MODEL", "gpt-5-mini"),
         # Azure
         azure_client_id=os.environ.get("AZURE_CLIENT_ID", ""),
         azure_client_secret=os.environ.get("AZURE_CLIENT_SECRET", ""),
@@ -113,6 +121,14 @@ def load_settings() -> Settings:
         cobra_tool_enabled=os.environ.get("COBRA_TOOL_ENABLED", "true").lower() == "true",
         cobra_tool_github_token=os.environ.get("COBRA_GITHUB_TOKEN", ""),
         cobra_tool_cache_ttl=int(os.environ.get("COBRA_TOOL_CACHE_TTL", "300")),
+        # MITRE ATT&CK
+        mitre_tool_enabled=os.environ.get("MITRE_TOOL_ENABLED", "true").lower() == "true",
+        mitre_tool_github_token=os.environ.get("MITRE_GITHUB_TOKEN", ""),
+        mitre_tool_cache_ttl=int(os.environ.get("MITRE_TOOL_CACHE_TTL", "3600")),
+        # Terraform Schema
+        tf_schema_tool_enabled=os.environ.get("TF_SCHEMA_TOOL_ENABLED", "true").lower() == "true",
+        tf_schema_github_token=os.environ.get("TF_SCHEMA_GITHUB_TOKEN", ""),
+        tf_schema_cache_ttl=int(os.environ.get("TF_SCHEMA_CACHE_TTL", "3600")),
         # Observability
         log_level=os.environ.get("LOG_LEVEL", "INFO"),
     )

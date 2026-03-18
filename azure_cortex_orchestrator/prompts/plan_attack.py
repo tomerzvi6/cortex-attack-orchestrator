@@ -42,18 +42,31 @@ and impact as applicable.
 """
 
 
-def build_plan_attack_prompt(cobra_intel: dict | None = None) -> str:
+def build_plan_attack_prompt(
+    cobra_intel: dict | None = None,
+    mitre_intel: dict | None = None,
+) -> str:
     """
-    Return the system prompt for plan_attack, optionally enriched with
-    cobra-tool attack intelligence as supplementary reference material.
+    Return the system prompt for plan_attack, optionally enriched with:
+    - cobra-tool attack intelligence (supplementary inspiration)
+    - MITRE ATT&CK live cloud technique reference (authoritative IDs)
 
-    When cobra intel is available its content is appended as a clearly
-    labelled section so the LLM can draw inspiration from real attack
-    implementations without being constrained to them.
+    The MITRE reference is injected first and labelled AUTHORITATIVE so the
+    LLM uses real technique IDs.  The cobra-tool content follows as
+    SUPPLEMENTARY so the LLM draws inspiration without being constrained.
     """
-    if not cobra_intel or not cobra_intel.get("files"):
-        return PLAN_ATTACK_SYSTEM_PROMPT
+    prompt = PLAN_ATTACK_SYSTEM_PROMPT
 
-    from azure_cortex_orchestrator.utils.cobra_tool import format_for_prompt
-    appendix = format_for_prompt(cobra_intel)
-    return PLAN_ATTACK_SYSTEM_PROMPT + appendix if appendix else PLAN_ATTACK_SYSTEM_PROMPT
+    if mitre_intel and mitre_intel.get("techniques"):
+        from azure_cortex_orchestrator.utils.mitre_tool import format_for_prompt as mitre_fmt
+        appendix = mitre_fmt(mitre_intel)
+        if appendix:
+            prompt = prompt + appendix
+
+    if cobra_intel and cobra_intel.get("files"):
+        from azure_cortex_orchestrator.utils.cobra_tool import format_for_prompt as cobra_fmt
+        appendix = cobra_fmt(cobra_intel)
+        if appendix:
+            prompt = prompt + appendix
+
+    return prompt

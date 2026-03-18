@@ -287,7 +287,7 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `OPENAI_API_KEY` | Yes | — | OpenAI API key |
-| `OPENAI_MODEL` | No | `gpt-4o-mini` | Model for reasoning nodes |
+| `OPENAI_MODEL` | No | `gpt-5-mini` | Model for reasoning nodes |
 | `AZURE_CLIENT_ID` | Live runs | — | Service Principal client ID |
 | `AZURE_CLIENT_SECRET` | Live runs | — | Service Principal secret |
 | `AZURE_TENANT_ID` | Live runs | — | Azure AD tenant ID |

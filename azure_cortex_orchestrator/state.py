@@ -54,7 +54,7 @@ class LLMUsageRecord(TypedDict, total=False):
     """Token and cost metrics for a single LLM call."""
 
     node: str                # Which graph node made the call
-    model: str               # Model used (e.g. "gpt-4o-mini")
+    model: str               # Model used (e.g. "gpt-5-mini")
     prompt_tokens: int       # Tokens in the prompt
     completion_tokens: int   # Tokens in the completion
     total_tokens: int        # prompt_tokens + completion_tokens
@@ -137,6 +137,8 @@ class OrchestratorState(TypedDict, total=False):
     llm_usage: list[LLMUsageRecord]  # Token/cost metrics per LLM call
     # ── External Intel ─────────────────────────────────────────
     cobra_intel: CobraIntel         # Live intel from the cobra-tool repo (optional)
+    mitre_intel: dict               # Live MITRE ATT&CK cloud techniques (optional)
+    terraform_schema_intel: dict    # Live azurerm provider schema reference (optional)
     # ── Reporting ─────────────────────────────────────────────────
     report_path: str                # Path to the generated report directory
     report: str                     # Full Markdown report content

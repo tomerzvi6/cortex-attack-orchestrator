@@ -62,6 +62,8 @@ from azure_cortex_orchestrator.nodes import (
     erasure_validator,
     execute_simulator,
     fetch_cobra_intel,
+    fetch_mitre_intel,
+    fetch_terraform_schema,
     generate_infrastructure,
     generate_report,
     generate_scenario,
@@ -90,12 +92,12 @@ def route_after_start(
 
 def route_after_review_plan(
     state: OrchestratorState,
-) -> Literal["generate_infrastructure", "plan_attack", "generate_report"]:
+) -> Literal["fetch_terraform_schema", "plan_attack", "generate_report"]:
     """
     Route after review_plan checkpoint:
     - If user aborted → skip to report
     - If user requested replan → loop back to plan_attack
-    - Otherwise → continue to generate_infrastructure
+    - Otherwise → fetch live terraform schema then generate_infrastructure
     """
     if state.get("user_aborted", False):
         return "generate_report"
@@ -103,7 +105,7 @@ def route_after_review_plan(
     if state.get("replan_requested", False):
         return "plan_attack"
 
-    return "generate_infrastructure"
+    return "fetch_terraform_schema"
 
 
 def route_after_approve_deploy(
@@ -177,6 +179,8 @@ def build_graph() -> StateGraph:
 
     # ── Add nodes ─────────────────────────────────────────────────
     graph.add_node("fetch_cobra_intel", fetch_cobra_intel)
+    graph.add_node("fetch_mitre_intel", fetch_mitre_intel)
+    graph.add_node("fetch_terraform_schema", fetch_terraform_schema)
     graph.add_node("generate_scenario", generate_scenario)
     graph.add_node("plan_attack", plan_attack)
     graph.add_node("review_plan", review_plan)
@@ -193,12 +197,13 @@ def build_graph() -> StateGraph:
 
     # ── Add edges ─────────────────────────────────────────────────
 
-    # START → fetch_cobra_intel (always first — pulls live intel before planning)
+    # START → fetch_cobra_intel → fetch_mitre_intel (both run before planning)
     graph.add_edge(START, "fetch_cobra_intel")
+    graph.add_edge("fetch_cobra_intel", "fetch_mitre_intel")
 
-    # fetch_cobra_intel → conditional: prompt mode or scenario mode
+    # fetch_mitre_intel → conditional: prompt mode or scenario mode
     graph.add_conditional_edges(
-        "fetch_cobra_intel",
+        "fetch_mitre_intel",
         route_after_start,
         {
             "generate_scenario": "generate_scenario",
@@ -212,16 +217,19 @@ def build_graph() -> StateGraph:
     # plan_attack → review_plan checkpoint
     graph.add_edge("plan_attack", "review_plan")
 
-    # Conditional: after review_plan → continue, replan, or abort
+    # Conditional: after review_plan → fetch schema then infra, replan, or abort
     graph.add_conditional_edges(
         "review_plan",
         route_after_review_plan,
         {
-            "generate_infrastructure": "generate_infrastructure",
+            "fetch_terraform_schema": "fetch_terraform_schema",
             "plan_attack": "plan_attack",
             "generate_report": "generate_report",
         },
     )
+
+    # fetch_terraform_schema → generate_infrastructure (always)
+    graph.add_edge("fetch_terraform_schema", "generate_infrastructure")
 
     # generate_infrastructure → safety_check → approve_deploy checkpoint
     graph.add_edge("generate_infrastructure", "safety_check")

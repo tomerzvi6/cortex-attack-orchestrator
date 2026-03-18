@@ -92,6 +92,44 @@ def _visible_nodes(is_freeform: bool, dry_run: bool, interactive: bool) -> list[
     return [n for n in PIPELINE_NODES if n["id"] not in skip]
 
 
+# ── Per-node hints shown while a node is executing ────────────────
+_NODE_HINTS: dict[str, str] = {
+    "fetch_cobra_intel":       "fetching live threat intel from GitHub...",
+    "generate_scenario":       "AI generating scenario from your prompt...",
+    "plan_attack":             "AI mapping attack to MITRE ATT&CK techniques...",
+    "generate_infrastructure": "AI generating Terraform code...",
+    "safety_check":            "validating Terraform against safety guardrails...",
+    "deploy_infrastructure":   "terraform init → plan → apply · ⏱️ may take 5–15 min",
+    "execute_simulator":       "running attack steps via cloud SDK...",
+    "validator":               "checking Cortex XDR for detections...",
+    "teardown":                "terraform destroy · ⏱️ may take 5–10 min",
+    "erasure_validator":       "verifying all cloud resources are removed...",
+    "generate_report":         "writing Markdown + JSON + ATT&CK Navigator report...",
+}
+
+
+def _show_node_running(status_ph, node_id: str) -> None:
+    """Update status_ph to show which node is currently executing with a duration hint."""
+    label = NODE_LABELS.get(node_id, {}).get("label", node_id)
+    hint = _NODE_HINTS.get(node_id, "")
+    hint_html = (
+        f" <span style='color:{COLORS['text_dim']};font-size:0.78rem;'>— {hint}</span>"
+        if hint else ""
+    )
+    status_ph.markdown(
+        f"<div style='color:{COLORS['primary']};font-size:0.85rem;'>"
+        f"🔄 Running: <b>{label}</b>{hint_html}</div>",
+        unsafe_allow_html=True,
+    )
+
+
+def _mark_remaining_as_skipped(node_statuses: dict, visible_nodes: list[dict]) -> None:
+    """Mark all still-pending visible nodes as skipped (dry-run, abort, reject paths)."""
+    for n in visible_nodes:
+        if node_statuses.get(n["id"]) == "pending":
+            node_statuses[n["id"]] = "skipped"
+
+
 def _run_nodes_streaming(
     node_names: list[str],
     state: dict,
@@ -106,12 +144,16 @@ def _run_nodes_streaming(
     Run a list of nodes, updating the pipeline visualisation and live
     output in real-time.  Returns True on success, False on error.
     """
-    # Mark the first pending node as running
+    # Mark the first pending node as running and show its live status
+    first_nid: str | None = None
     for n in visible_nodes:
         if n["id"] in node_names and node_statuses.get(n["id"]) == "pending":
             node_statuses[n["id"]] = "running"
+            first_nid = n["id"]
             break
     pipeline_ph.html(render_pipeline(visible_nodes, node_statuses, node_durations))
+    if first_nid:
+        _show_node_running(status_ph, first_nid)
 
     with st.spinner("Running pipeline nodes..."):
         for event in run_phase(node_names, state):
@@ -119,34 +161,45 @@ def _run_nodes_streaming(
             if event.status == "failed":
                 node_statuses[nid] = "failed"
                 _SS.sim_error = event.error
+                failed_label = NODE_LABELS.get(nid, {}).get("label", nid)
                 status_ph.markdown(
-                    f"<div style='color:{COLORS['danger']};font-size:0.85rem;'>❌ Error: {event.error}</div>",
+                    f"<div style='color:{COLORS['danger']};font-size:0.85rem;'>"
+                    f"❌ <b>{failed_label}</b> failed: {event.error}</div>",
                     unsafe_allow_html=True,
                 )
                 pipeline_ph.html(render_pipeline(visible_nodes, node_statuses, node_durations))
                 _SS.sim_events.append(event)
                 return False
 
-            # Completed
+            # Node completed — update status and find next
             node_statuses[nid] = "completed"
             node_durations[nid] = event.duration_ms
             _SS.sim_events.append(event)
 
-            # Set next node as running
+            # Find and mark the next pending node as running
+            next_nid: str | None = None
             found = False
             for n in visible_nodes:
                 if found and node_statuses.get(n["id"]) == "pending":
                     node_statuses[n["id"]] = "running"
+                    next_nid = n["id"]
                     break
                 if n["id"] == nid:
                     found = True
 
-            label = NODE_LABELS.get(nid, {}).get("label", nid)
-            status_ph.markdown(
-                f"<div style='color:{COLORS['primary']};font-size:0.85rem;'>✅ {label} completed</div>",
-                unsafe_allow_html=True,
-            )
             pipeline_ph.html(render_pipeline(visible_nodes, node_statuses, node_durations))
+
+            if next_nid:
+                # Show which node is now executing so user knows what to expect
+                _show_node_running(status_ph, next_nid)
+            else:
+                # Last node — show completion
+                label = NODE_LABELS.get(nid, {}).get("label", nid)
+                status_ph.markdown(
+                    f"<div style='color:{COLORS['success']};font-size:0.85rem;'>"
+                    f"✅ <b>{label}</b> completed</div>",
+                    unsafe_allow_html=True,
+                )
 
             # Live output card
             node_html = render_node_output(nid, event.output)
@@ -594,19 +647,17 @@ with col_pipeline:
         if not ok:
             _SS.sim_phase = "error"
             st.rerun()
-        elif state.get("dry_run", False):
-            # Dry run: skip deploy, go straight to report
-            _SS.sim_phase = "run_report"
-            st.rerun()
-        elif state.get("deploy_status") == "unsafe":
-            # Unsafe: skip to report
+        elif state.get("dry_run", False) or state.get("deploy_status") == "unsafe":
+            # CLI approve_deploy is a no-op in dry_run/unsafe — mark pending nodes skipped
+            _mark_remaining_as_skipped(node_statuses, vis)
+            _SS.sim_node_statuses = dict(node_statuses)
             _SS.sim_phase = "run_report"
             st.rerun()
         elif _SS.sim_config.get("interactive", False):
-            # Pause for deploy approval
+            # Interactive: show approve_deploy checkpoint (matches CLI interactive behavior)
             _SS.sim_phase = "approve_deploy"
             node_statuses["approve_deploy"] = "running"
-            _SS.sim_node_statuses = node_statuses
+            _SS.sim_node_statuses = dict(node_statuses)
             st.rerun()
         else:
             _SS.sim_phase = "run_deploy"
@@ -793,8 +844,10 @@ with col_pipeline:
             _SS.sim_phase = "error"
             st.rerun()
         elif state.get("deploy_status") == "unsafe":
-            # Safety check failed on retried code -> teardown
-            _SS.sim_phase = "run_teardown"
+            # Safety check failed on retry — no infra deployed, go to report (matches CLI)
+            _mark_remaining_as_skipped(node_statuses, vis)
+            _SS.sim_node_statuses = dict(node_statuses)
+            _SS.sim_phase = "run_report"
             st.rerun()
         else:
             # Re-attempt deploy
@@ -884,9 +937,16 @@ with col_pipeline:
         node_statuses = dict(_SS.sim_node_statuses)
         node_durations = dict(_SS.sim_node_durations)
 
+        # Mark any still-pending nodes as skipped (abort / dry-run / reject / keep-alive paths)
+        _mark_remaining_as_skipped(node_statuses, vis)
+        _SS.sim_node_statuses = dict(node_statuses)
+
         pipeline_ph = st.empty()
         status_ph = st.empty()
         output_container = st.container()
+
+        # Pre-render pipeline so skipped nodes are visible before report runs
+        pipeline_ph.html(render_pipeline(vis, node_statuses, node_durations))
 
         for ev in _SS.sim_events:
             html = render_node_output(ev.node_name, ev.output)
@@ -1057,6 +1117,9 @@ with col_pipeline:
         vis = _SS.sim_visible_nodes
         node_statuses = dict(_SS.sim_node_statuses)
         node_durations = dict(_SS.sim_node_durations)
+
+        # Mark any remaining pending nodes as skipped so pipeline renders cleanly
+        _mark_remaining_as_skipped(node_statuses, vis)
 
         st.html(render_pipeline(vis, node_statuses, node_durations))
 

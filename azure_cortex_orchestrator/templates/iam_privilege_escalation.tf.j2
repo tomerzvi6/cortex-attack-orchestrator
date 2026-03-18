@@ -53,34 +53,15 @@ resource "azurerm_user_assigned_identity" "sim" {
   }
 }
 
-# ── VULNERABLE: Custom Role with roleAssignments/write ────────────
-# This is intentionally over-privileged for the simulation.
-resource "azurerm_role_definition" "sim" {
-  name        = "{{ resource_group_name }}-custom-role"
-  scope       = "/subscriptions/{{ subscription_id }}"
-  description = "Custom role with role assignment write — cortex simulation"
-
-  permissions {
-    actions = [
-      "Microsoft.Authorization/roleAssignments/write",
-      "Microsoft.Authorization/roleAssignments/read",
-      "Microsoft.Authorization/roleAssignments/delete",
-      "Microsoft.Authorization/roleDefinitions/read",
-      "Microsoft.Resources/subscriptions/resourceGroups/read",
-    ]
-    not_actions = []
-  }
-
-  assignable_scopes = [
-    "/subscriptions/{{ subscription_id }}"
-  ]
-}
-
-# ── Role Assignment: custom role → attacker identity ──────────────
+# ── VULNERABLE: Over-privileged role assignment (attacker identity) ──────────
+# Assigns the built-in "User Access Administrator" role to the attacker identity.
+# This grants Microsoft.Authorization/roleAssignments/write, enabling the attacker
+# to manipulate role assignments and escalate to Owner — the target of this scenario.
+# Using a built-in role avoids the need for roleDefinitions/write permission on the SP.
 resource "azurerm_role_assignment" "sim" {
-  scope              = "/subscriptions/{{ subscription_id }}"
-  role_definition_id = azurerm_role_definition.sim.role_definition_resource_id
-  principal_id       = azurerm_user_assigned_identity.sim.principal_id
+  scope                = "/subscriptions/{{ subscription_id }}"
+  role_definition_name = "User Access Administrator"
+  principal_id         = azurerm_user_assigned_identity.sim.principal_id
 }
 
 # ── Log Analytics Workspace ──────────────────────────────────────
@@ -93,6 +74,9 @@ resource "azurerm_log_analytics_workspace" "sim" {
 }
 
 # ── Diagnostic Setting (Activity Log → Log Analytics) ─────────────
+# target_resource_id points to the subscription, so only activity-log categories
+# are valid: Administrative, Security, Alert, Policy, ServiceHealth, Recommendation.
+# Do NOT use StorageRead/Write/Delete here — those are only for /blobServices/default.
 resource "azurerm_monitor_diagnostic_setting" "activity_logs" {
   name                       = "activity-log-to-law"
   target_resource_id         = "/subscriptions/{{ subscription_id }}"
@@ -120,10 +104,11 @@ output "identity_client_id" {
   value = azurerm_user_assigned_identity.sim.client_id
 }
 
-output "custom_role_id" {
-  value = azurerm_role_definition.sim.role_definition_resource_id
+output "role_assignment_id" {
+  value = azurerm_role_assignment.sim.id
 }
 
 output "log_analytics_workspace_id" {
   value = azurerm_log_analytics_workspace.sim.id
 }
+

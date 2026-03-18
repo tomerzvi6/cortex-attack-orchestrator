@@ -25,6 +25,7 @@ from azure_cortex_orchestrator.prompts import (
     GENERATE_INFRA_SYSTEM_PROMPT,
     GENERATE_SCENARIO_SYSTEM_PROMPT,
     PLAN_ATTACK_SYSTEM_PROMPT,
+    build_generate_infrastructure_prompt,
     build_generate_scenario_prompt,
     build_plan_attack_prompt,
 )
@@ -46,8 +47,8 @@ _openai_client: OpenAI | None = None
 
 def _get_settings() -> Settings:
     global _settings
-    if _settings is None:
-        _settings = load_settings()
+    # Always reload so .env changes are picked up without process restart
+    _settings = load_settings()
     return _settings
 
 
@@ -182,7 +183,7 @@ def _call_openai(
 # Prices per 1K tokens (USD). Update as OpenAI publishes new prices.
 _MODEL_PRICING: dict[str, tuple[float, float]] = {
     # (prompt_per_1k, completion_per_1k)
-    "gpt-4o-mini": (0.00015, 0.0006),
+    "gpt-5-mini": (0.00015, 0.0006),
     "gpt-4o": (0.005, 0.015),
 }
 
@@ -195,7 +196,7 @@ def _estimate_cost(
     """
     Estimate the cost of an OpenAI API call in USD.
 
-    Falls back to gpt-4o-mini pricing for unknown models.
+    Falls back to gpt-5-mini pricing for unknown models.
     """
     # Normalise model name for lookup (strip date suffixes like -0613)
     model_key = model.lower()
@@ -207,8 +208,8 @@ def _estimate_cost(
                 + (completion_tokens / 1000) * completion_rate
             )
 
-    # Default to gpt-4o-mini pricing if model is unrecognised
-    prompt_rate, completion_rate = _MODEL_PRICING["gpt-4o-mini"]
+    # Default to gpt-5-mini pricing if model is unrecognised
+    prompt_rate, completion_rate = _MODEL_PRICING["gpt-5-mini"]
     return (
         (prompt_tokens / 1000) * prompt_rate
         + (completion_tokens / 1000) * completion_rate
@@ -285,6 +286,117 @@ def fetch_cobra_intel(state: OrchestratorState) -> dict[str, Any]:
         except Exception as exc:
             log.warning(
                 "cobra-tool: failed to fetch intel (%s) — continuing without it",
+                exc,
+            )
+            return {}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NODE: fetch_mitre_intel
+# ══════════════════════════════════════════════════════════════════
+
+
+def fetch_mitre_intel(state: OrchestratorState) -> dict[str, Any]:
+    """
+    Node: Fetch live MITRE ATT&CK cloud technique data from mitre/cti.
+
+    Runs immediately after fetch_cobra_intel, before scenario generation or
+    attack planning.  Downloads the enterprise-attack STIX bundle (cached
+    after the first run), filters for cloud/IaaS techniques, and stores the
+    result in state['mitre_intel'].
+
+    Downstream node plan_attack injects these authoritative technique IDs
+    into the LLM prompt so the model never invents non-existent IDs.
+
+    Graceful degradation: any error is caught and logged.  The run continues
+    normally with LLM training-data fallback.  Disable via MITRE_TOOL_ENABLED=false.
+    """
+    with node_logger("fetch_mitre_intel", state.get("run_id", "")) as log:
+        settings = _get_settings()
+
+        if not settings.mitre_tool_enabled:
+            log.info("mitre-tool integration disabled (MITRE_TOOL_ENABLED=false)")
+            return {}
+
+        try:
+            from azure_cortex_orchestrator.utils.mitre_tool import (
+                fetch as mitre_fetch,
+            )
+
+            token = settings.mitre_tool_github_token or settings.cobra_tool_github_token or None
+            intel = mitre_fetch(
+                github_token=token,
+                cache_ttl=settings.mitre_tool_cache_ttl,
+            )
+            if intel:
+                log.info("mitre-tool intel ready: %s", intel["summary"])
+                return {"mitre_intel": intel}
+            else:
+                log.warning("mitre-tool: no intel available (fetch returned None)")
+                return {}
+
+        except Exception as exc:
+            log.warning(
+                "mitre-tool: failed to fetch intel (%s) — continuing without it",
+                exc,
+            )
+            return {}
+
+
+# ══════════════════════════════════════════════════════════════════
+#  NODE: fetch_terraform_schema
+# ══════════════════════════════════════════════════════════════════
+
+
+def fetch_terraform_schema(state: OrchestratorState) -> dict[str, Any]:
+    """
+    Node: Fetch live azurerm provider schema reference from the official repo.
+
+    Runs between review_plan and generate_infrastructure.  Downloads
+    documentation pages for commonly-used azurerm resources (cached after
+    the first run), parses deprecated/removed argument names, and stores
+    the result in state['terraform_schema_intel'].
+
+    Downstream node generate_infrastructure injects this schema reference
+    into the LLM prompt so the model uses only valid argument names for the
+    current provider version — eliminating the class of errors that require
+    hardcoded workarounds in the prompt and post-processing sanitizer.
+
+    Graceful degradation: any error is caught and logged.  The run continues
+    normally with the existing hardcoded constraints.  Disable via
+    TF_SCHEMA_TOOL_ENABLED=false.
+    """
+    with node_logger("fetch_terraform_schema", state.get("run_id", "")) as log:
+        settings = _get_settings()
+
+        if not settings.tf_schema_tool_enabled:
+            log.info(
+                "terraform-schema integration disabled (TF_SCHEMA_TOOL_ENABLED=false)"
+            )
+            return {}
+
+        try:
+            from azure_cortex_orchestrator.utils.terraform_schema_tool import (
+                fetch as schema_fetch,
+            )
+
+            token = settings.tf_schema_github_token or settings.cobra_tool_github_token or None
+            intel = schema_fetch(
+                github_token=token,
+                cache_ttl=settings.tf_schema_cache_ttl,
+            )
+            if intel:
+                log.info("terraform-schema intel ready: %s", intel["summary"])
+                return {"terraform_schema_intel": intel}
+            else:
+                log.warning(
+                    "terraform-schema: no intel available (fetch returned None)"
+                )
+                return {}
+
+        except Exception as exc:
+            log.warning(
+                "terraform-schema: failed to fetch intel (%s) — continuing without it",
                 exc,
             )
             return {}
@@ -442,7 +554,10 @@ def plan_attack(state: OrchestratorState) -> dict[str, Any]:
 
         log.info("Calling OpenAI to generate attack plan for: %s", goal)
         response, usage_record = _call_openai(
-            build_plan_attack_prompt(state.get("cobra_intel")),
+            build_plan_attack_prompt(
+                cobra_intel=state.get("cobra_intel"),
+                mitre_intel=state.get("mitre_intel"),
+            ),
             user_prompt,
             node_name="plan_attack",
             json_mode=True,
@@ -502,7 +617,15 @@ def _sanitize_terraform_code(code: str) -> str:
         flags=re.MULTILINE,
     )
 
-    # 2. Replace `source = "..."` with `source_content` in azurerm_storage_blob
+    # 2. Remove `tags` blocks from azurerm_subnet (does not support tags)
+    code = re.sub(
+        r'(resource\s+"azurerm_subnet"\s+"[^"]*"\s*\{[^}]*?)\s*tags\s*=\s*\{[^}]*\}\s*\n',
+        r'\1',
+        code,
+        flags=re.DOTALL,
+    )
+
+    # 3. Replace `source = "..."` with `source_content` in azurerm_storage_blob
     #    to avoid referencing local files that don't exist.
     code = re.sub(
         r'(resource\s+"azurerm_storage_blob"[^}]*?)'
@@ -512,7 +635,7 @@ def _sanitize_terraform_code(code: str) -> str:
         flags=re.DOTALL,
     )
 
-    # 3. Fix diagnostic setting log categories for storage accounts.
+    # 4. Fix diagnostic setting log categories for storage accounts.
     #    Azure storage requires StorageRead/StorageWrite/StorageDelete,
     #    not Read/Write/Delete.
     _STORAGE_DIAG_CAT_MAP = {
@@ -533,6 +656,38 @@ def _sanitize_terraform_code(code: str) -> str:
         _fix_diag_block,
         code,
         flags=re.DOTALL,
+    )
+
+    # 5. Replace Standard_DS1_v2 with Standard_B2s (DS1_v2 is frequently
+    #    capacity-constrained in eastus2 and other popular regions).
+    code = re.sub(
+        r'Standard_DS1_v2',
+        'Standard_B2s',
+        code,
+    )
+
+    # 6. Replace eastus2 with eastus for better VM SKU availability.
+    #    Only replace in location fields and provider blocks, not in comments.
+    code = re.sub(
+        r'(location\s*=\s*"?)eastus2("?)',
+        r'\1eastus\2',
+        code,
+    )
+
+    # 7. Fix missing newlines before closing braces.
+    #    LLM sometimes puts `]}\n` or `"}\n` on one line.
+    code = re.sub(
+        r'(\])\}',
+        r'\1\n}',
+        code,
+    )
+
+    # 8. Remove LLM placeholder values like "<your_...>" or "<YOUR_...>".
+    #    These cause Terraform parse errors at apply time.
+    code = re.sub(
+        r'"<[Yy]our_[^"]*>"',
+        '""',
+        code,
     )
 
     return code
@@ -587,7 +742,28 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
                 pass
 
             # ── Template-direct path: use pre-validated scenario template
-            scenario_template_name = f"{scenario_id}.tf.j2"
+            # Map common LLM-generated scenario IDs to known templates
+            _SCENARIO_TEMPLATE_ALIASES: dict[str, str] = {
+                # Azure IAM / privilege escalation variants
+                "azure_low_privilege_role_assignment": "iam_privilege_escalation",
+                "low_privilege_role_assignment": "iam_privilege_escalation",
+                "azure_iam_privilege_escalation": "iam_privilege_escalation",
+                "azure_role_escalation": "iam_privilege_escalation",
+                "privilege_escalation": "iam_privilege_escalation",
+                "role_assignment_escalation": "iam_privilege_escalation",
+                # Azure storage variants
+                "azure_storage_data_exfil": "storage_data_exfil",
+                "azure_storage_exfiltration": "storage_data_exfil",
+                "blob_data_exfiltration": "storage_data_exfil",
+                # Azure VM variants
+                "azure_vm_identity_log_deletion": "vm_identity_log_deletion",
+                "vm_log_deletion": "vm_identity_log_deletion",
+                "azure_vm_log_tampering": "vm_identity_log_deletion",
+            }
+            resolved_template_id = _SCENARIO_TEMPLATE_ALIASES.get(
+                scenario_id, scenario_id
+            )
+            scenario_template_name = f"{resolved_template_id}.tf.j2"
             scenario_template_exists = (
                 scenario_id != "custom"
                 and (templates_dir / scenario_template_name).is_file()
@@ -687,7 +863,9 @@ def generate_infrastructure(state: OrchestratorState) -> dict[str, Any]:
                     "Calling OpenAI to generate Terraform (first run)"
                 )
                 response, usage_record = _call_openai(
-                    GENERATE_INFRA_SYSTEM_PROMPT,
+                    build_generate_infrastructure_prompt(
+                        terraform_schema_intel=state.get("terraform_schema_intel"),
+                    ),
                     user_prompt,
                     max_tokens=8192,
                     node_name="generate_infrastructure",
@@ -1033,17 +1211,25 @@ def deploy_infrastructure(state: OrchestratorState) -> dict[str, Any]:
 
         try:
             # Init
+            log.info("[1/3] Running terraform init...")
             tf_runner.init()
+            log.info("[1/3] terraform init complete")
 
             # Plan (for output capture)
+            log.info("[2/3] Running terraform plan...")
             plan_output = tf_runner.plan()
+            log.info("[2/3] terraform plan complete")
             log.info("Terraform plan output:\n%s", plan_output[:1000])
 
             # Apply — only prompt for confirmation in CLI interactive mode
             interactive = state.get("interactive", False)
+            log.info(
+                "[3/3] Running terraform apply (auto_approve=%s) "
+                "— this may take several minutes...",
+                not interactive,
+            )
             tf_runner.apply(auto_approve=not interactive)
-
-            log.info("Infrastructure deployed successfully")
+            log.info("[3/3] terraform apply complete — infrastructure deployed successfully")
 
             # Persist run manifest so orphaned infra can be recovered
             manifest = RunManifest(
@@ -1330,8 +1516,9 @@ def teardown(state: OrchestratorState) -> dict[str, Any]:
             tf_runner.write_tf_files(tf_code)
 
         try:
+            log.info("Running terraform destroy — this may take several minutes...")
             output = tf_runner.destroy(auto_approve=True)
-            log.info("Infrastructure destroyed successfully")
+            log.info("terraform destroy complete — infrastructure destroyed successfully")
 
             # Update run manifest to reflect successful teardown
             manifest = RunManifest.load(

@@ -15,6 +15,7 @@ from azure_cortex_orchestrator.prompts.plan_attack import (
 from azure_cortex_orchestrator.prompts.generate_infrastructure import (
     FIX_TERRAFORM_SYSTEM_PROMPT,
     GENERATE_INFRA_SYSTEM_PROMPT,
+    build_generate_infrastructure_prompt,
 )
 from azure_cortex_orchestrator.prompts.generate_scenario import (
     GENERATE_SCENARIO_SYSTEM_PROMPT,
@@ -26,6 +27,7 @@ __all__ = [
     "build_plan_attack_prompt",
     "FIX_TERRAFORM_SYSTEM_PROMPT",
     "GENERATE_INFRA_SYSTEM_PROMPT",
+    "build_generate_infrastructure_prompt",
     "GENERATE_SCENARIO_SYSTEM_PROMPT",
     "build_generate_scenario_prompt",
 ]

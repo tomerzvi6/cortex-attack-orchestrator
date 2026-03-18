@@ -10,7 +10,7 @@
     - location: Azure region (default: eastus)
     - subscription_id: Azure subscription ID
     - vm_name: Name of the virtual machine
-    - vm_size: VM size (default: Standard_B1s)
+    - vm_size: VM size (default: Standard_DS1_v2)
     - admin_username: VM admin username
     - tags: Dict of Azure resource tags
 #}
@@ -32,7 +32,7 @@ provider "azurerm" {
 # ── Resource Group ────────────────────────────────────────────────
 resource "azurerm_resource_group" "sim" {
   name     = "{{ resource_group_name }}"
-  location = "{{ location | default('eastus') }}"
+  location = "{{ location | default('eastus2') }}"
 
   tags = {
     environment = "cortex-simulation"
@@ -73,7 +73,7 @@ resource "azurerm_linux_virtual_machine" "sim" {
   name                            = "{{ vm_name | default('sim-vm') }}"
   resource_group_name             = azurerm_resource_group.sim.name
   location                        = azurerm_resource_group.sim.location
-  size                            = "{{ vm_size | default('Standard_B1s') }}"
+  size                            = "{{ vm_size | default('Standard_DS1_v2') }}"
   admin_username                  = "{{ admin_username | default('simadmin') }}"
   disable_password_authentication = true
 

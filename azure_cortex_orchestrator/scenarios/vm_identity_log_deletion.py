@@ -79,7 +79,7 @@ SCENARIO = Scenario(
             "Diagnostic settings forwarding Activity Logs (to be deleted by attacker)",
         ],
         "region": "eastus",
-        "vm_size": "Standard_B1s",
+        "vm_size": "Standard_B2s",
         "os": "Ubuntu 22.04 LTS",
     },
 
