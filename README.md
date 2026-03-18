@@ -15,6 +15,12 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 │  │        fetch_cobra_intel             │                     │
 │  │  (GitHub API · SHA cache · CDN fetch)│                     │
 │  └──────────────────────┬───────────────┘                     │
+│                         │                                     │
+│                         ▼                                     │
+│  ┌──────────────────────────────────────┐                     │
+│  │        fetch_mitre_intel             │                     │
+│  │  (mitre/cti · cloud techniques)      │                     │
+│  └──────────────────────┬───────────────┘                     │
 │    │                    │                                     │
 │    ├── [--prompt provided] ──▶ ┌───────────────────┐          │
 │    │                           │ generate_scenario  │          │
@@ -22,10 +28,17 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 │    │                           └────────┬──────────┘          │
 │    │                                    │                     │
 │    ▼◀───────────────────────────────────┘                     │
-│  ┌──────────────┐     ┌─────────────────────────┐             │
-│  │ plan_attack   │────▶│ generate_infrastructure │◀─┐         │
-│  │ (OpenAI+ATT&CK)│    │ (OpenAI+Terraform)      │  │ retry  │
-│  └──────────────┘     └──────────┬──────────────┘  │         │
+│  ┌──────────────┐  ┌──────────────────────┐                   │
+│  │ plan_attack   │─▶│ fetch_terraform_     │                   │
+│  │ (OpenAI+ATT&CK)│ │ schema               │                   │
+│  └──────────────┘  │ (azurerm provider    │                   │
+│                    │  schema · SHA cache) │                   │
+│                    └──────────┬───────────┘                   │
+│                               ▼                               │
+│                    ┌─────────────────────────┐  ◀─┐          │
+│                    │ generate_infrastructure  │    │ retry   │
+│                    │ (OpenAI+Terraform)       │    │         │
+│                    └──────────┬──────────────┘    │         │
 │                                  │                  │         │
 │                                  ▼                  │         │
 │                       ┌──────────────────┐          │         │
@@ -79,8 +92,10 @@ An agentic, multi-cloud attack simulation system built with **LangGraph**. It pl
 ## Features
 
 - **Live cobra-tool Intel** — On every run the orchestrator fetches the latest attack definitions from [PaloAltoNetworks/cobra-tool](https://github.com/PaloAltoNetworks/cobra-tool) via the GitHub API. The LLM receives real-world offensive tooling patterns as supplementary reference alongside its built-in MITRE ATT&CK knowledge. A two-level cache (TTL + commit SHA) keeps overhead minimal; GitHub being unreachable never blocks a run.
+- **Live MITRE ATT&CK Intel** — The `fetch_mitre_intel` node downloads the official [mitre/cti](https://github.com/mitre/cti) STIX bundle, filters for cloud/IaaS techniques (Azure, AWS, IaaS, SaaS), and injects authoritative technique IDs into the attack-planning prompt — the LLM never invents non-existent technique IDs. SHA-cached with a 1-hour TTL; gracefully skipped if GitHub is unreachable.
+- **Live Terraform Schema Intel** — The `fetch_terraform_schema` node fetches current resource documentation from [hashicorp/terraform-provider-azurerm](https://github.com/hashicorp/terraform-provider-azurerm), parses deprecated/removed argument names, and supplements the infrastructure-generation prompt with a precise schema reference — eliminating a whole class of outdated-argument errors. SHA-cached with a 1-hour TTL.
 - **Free-Text Prompt Mode** — Describe an attack scenario in natural language; the AI generates a full scenario (cloud provider, MITRE techniques, simulation steps, Terraform hints) on the fly
-- **MITRE ATT&CK Mapping** — AI-powered attack planning with technique IDs
+- **MITRE ATT&CK Mapping** — AI-powered attack planning with authoritative technique IDs sourced live from the official STIX bundle
 - **Multi-Cloud** — Azure and AWS scenarios with pluggable cloud provider layer
 - **Terraform IaC** — Auto-generated vulnerable cloud infrastructure
 - **Two-Layer Safety Guardrails** — Regex on HCL source + `terraform plan -json` resolved-value analysis; cloud-aware checks for both Azure (resource group prefix, subscription allowlist, AAD blocklist) and AWS (organizations blocklist, wildcard IAM policy, public S3 ACL, bucket naming)
@@ -131,7 +146,7 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 python -m azure_cortex_orchestrator.main --dry-run --scenario vm_identity_log_deletion
 ```
 
-This tests the full LangGraph flow: plan_attack → generate_infrastructure → safety_check → generate_report, without deploying anything.
+This tests the full LangGraph flow: `fetch_cobra_intel → fetch_mitre_intel → plan_attack → fetch_terraform_schema → generate_infrastructure → safety_check → generate_report`, without deploying anything.
 
 ### 5. Full live run (Azure)
 
@@ -244,16 +259,23 @@ azure_cortex_orchestrator/
 │   ├── simulated.py         # Rule-based simulated validator
 │   └── erasure.py           # Post-teardown resource erasure verifier
 ├── utils/
-│   ├── observability.py     # Structured logging + tracing
-│   ├── terraform.py         # Terraform CLI wrapper (incl. plan_json)
-│   ├── azure_helpers.py     # Azure SDK helpers
-│   ├── run_manifest.py      # Crash-recovery run manifest persistence
-│   ├── reporting.py         # Report generation
-│   └── cobra_tool.py        # Live GitHub fetcher for cobra-tool intel (SHA cache + CDN)
+│   ├── observability.py          # Structured logging + tracing
+│   ├── terraform.py              # Terraform CLI wrapper (incl. plan_json)
+│   ├── azure_helpers.py          # Azure SDK helpers
+│   ├── run_manifest.py           # Crash-recovery run manifest persistence
+│   ├── reporting.py              # Report generation
+│   ├── cobra_tool.py             # Live GitHub fetcher for cobra-tool intel (SHA cache + CDN)
+│   ├── mitre_tool.py             # Live fetcher for MITRE ATT&CK cloud techniques (mitre/cti)
+│   └── terraform_schema_tool.py  # Live fetcher for azurerm provider schema reference
 ├── templates/
 │   ├── base_infra.tf.j2     # Jinja2 Terraform template (Azure)
 │   └── base_infra_aws.tf.j2 # Jinja2 Terraform template (AWS)
 └── reports/                 # Generated reports (per run_id)
+
+# Root-level utility scripts
+create_service_principal.py  # Helper: create Azure Service Principal for simulations
+fix_permissions.py           # Helper: fix Azure SP role assignments
+test_infra_deploy.py         # Helper: smoke-test Terraform deploy/destroy cycle
 ```
 
 ## Adding a New Scenario
@@ -304,6 +326,12 @@ python -m azure_cortex_orchestrator.main --list-scenarios
 | `COBRA_TOOL_ENABLED` | No | `true` | Enable/disable live cobra-tool intel |
 | `COBRA_GITHUB_TOKEN` | No | — | GitHub PAT — raises API rate limit 60→5000/hr |
 | `COBRA_TOOL_CACHE_TTL` | No | `300` | Seconds before re-checking cobra-tool commit SHA |
+| `MITRE_TOOL_ENABLED` | No | `true` | Enable/disable live MITRE ATT&CK intel |
+| `MITRE_GITHUB_TOKEN` | No | — | GitHub PAT for mitre/cti (falls back to `COBRA_GITHUB_TOKEN`) |
+| `MITRE_TOOL_CACHE_TTL` | No | `3600` | Seconds before re-checking MITRE commit SHA |
+| `TF_SCHEMA_TOOL_ENABLED` | No | `true` | Enable/disable live Terraform schema intel |
+| `TF_SCHEMA_GITHUB_TOKEN` | No | — | GitHub PAT for azurerm repo (falls back to `COBRA_GITHUB_TOKEN`) |
+| `TF_SCHEMA_CACHE_TTL` | No | `3600` | Seconds before re-checking azurerm provider commit SHA |
 
 ## Live cobra-tool Integration
 
@@ -320,6 +348,36 @@ Downstream nodes `plan_attack` and `generate_scenario` automatically append the 
 - **SHA cache** — repo unchanged? TTL is refreshed without re-downloading files
 
 **Graceful degradation** — if GitHub is unreachable, rate-limited, or the token is missing, the run continues exactly as before with no cobra intel. The integration is also disableable via `COBRA_TOOL_ENABLED=false`.
+
+## Live MITRE ATT&CK Integration
+
+The orchestrator maintains a **live connection** to [mitre/cti](https://github.com/mitre/cti), the official MITRE ATT&CK STIX repository. At the start of every run (after `fetch_cobra_intel`), the `fetch_mitre_intel` node:
+
+1. Calls the GitHub API to retrieve the latest commit SHA on the `master` branch (1 API call)
+2. If the SHA changed, downloads the `enterprise-attack.json` STIX bundle via raw CDN (no API quota cost)
+3. Filters for cloud/IaaS-relevant techniques covering Azure, AWS, IaaS, SaaS, and Office 365 platforms
+4. Stores structured technique data (IDs, names, tactics, descriptions) in `OrchestratorState` as `mitre_intel`
+
+The `plan_attack` node injects these authoritative technique IDs into the LLM prompt, ensuring the model uses only real, current MITRE ATT&CK identifiers — never hallucinated ones.
+
+**Two-level cache** (TTL default 1 hour + commit SHA) ensures the 50 MB STIX bundle is only re-downloaded when MITRE actually updates it.
+
+**Graceful degradation** — any network or parsing error is caught and logged. The run continues with LLM training-data fallback. Disable via `MITRE_TOOL_ENABLED=false`.
+
+## Live Terraform Schema Integration
+
+The orchestrator fetches live resource documentation from [hashicorp/terraform-provider-azurerm](https://github.com/hashicorp/terraform-provider-azurerm) to prevent the LLM from generating outdated or invalid Terraform argument names. The `fetch_terraform_schema` node runs between `review_plan` and `generate_infrastructure`:
+
+1. Calls the GitHub API to retrieve the latest provider repo commit SHA (1 API call)
+2. If the SHA changed, downloads markdown documentation pages for the most commonly used `azurerm` resources via raw CDN
+3. Parses deprecation warnings, removed arguments, and required/optional argument lists
+4. Stores the structured schema reference in `OrchestratorState` as `terraform_schema_intel`
+
+The `generate_infrastructure` node appends this schema reference to the LLM prompt, so the model uses only valid argument names for the current provider version — eliminating the need for hardcoded workarounds and reducing Terraform apply errors.
+
+**Resources covered by default:** `resource_group`, `storage_account`, `storage_container`, `storage_blob`, `linux_virtual_machine`, `virtual_network`, `subnet`, `network_interface`, `network_security_group`, `role_assignment`, `user_assigned_identity`, `key_vault`, `key_vault_secret`, `monitor_diagnostic_setting`, `log_analytics_workspace`.
+
+**Graceful degradation** — any network or parsing error is caught and logged. The run continues with existing hardcoded constraints in the prompt. Disable via `TF_SCHEMA_TOOL_ENABLED=false`.
 
 ## Reports
 
